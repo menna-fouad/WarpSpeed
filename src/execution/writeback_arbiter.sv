@@ -27,6 +27,9 @@ module writeback_arbiter (
     input logic is_load,
     input logic is_store,
 
+    // Global stall (OR of every lane's buffer_full)
+    input logic stall,
+
     // Output address, data, and write enable to register bank
     output logic [9:0] rf_write_addr,
     output logic [31:0] rf_write_data,
@@ -38,84 +41,96 @@ module writeback_arbiter (
     logic alu_writeback_valid;
     assign alu_writeback_valid = alu_valid && !is_branch && !is_load && !is_store;
 
-    // signals to FIFOs
-    logic buffer_empty;
-    logic [9:0] buffer_head_addr;
-    logic [31:0] buffer_head_data;
+    // Incoming results, indexed by source
+    logic [3:0] in_valid;
+    logic [3:0][9:0] in_addr;
+    logic [3:0][31:0] in_data;
 
-    logic grant_buffer;
-    logic grant_lsu_curr, grant_fma_curr;
-    logic grant_alu_curr, grant_special_reg_curr;
+    assign in_valid = {special_reg_valid, alu_writeback_valid, fma_valid, lsu_valid} & {4{!stall}};
+    assign in_addr = {special_reg_addr, alu_addr, fma_addr, lsu_addr};
+    assign in_data = {special_reg_data, alu_data, fma_data, lsu_data};
 
-    // Decide which source to choose from
-    // FIFO gets priority since it contains data from older instructions
-    // The priority logic for incomg signals is: LSU > FMA > ALU
+    // One FIFO per source
+    logic [3:0] fifo_push, fifo_pop, fifo_empty, fifo_full;
+    logic [3:0][9:0] head_addr;
+    logic [3:0][31:0] head_data;
 
-    assign grant_buffer = !buffer_empty;
+    genvar s;
+    generate
+        for (s = 0; s < 4; ++s) begin : g_fifo
+            writeback_fifo #(.DEPTH(16)) u_buffer (
+                .clk(clk),
+                .reset(reset),
 
-    assign grant_lsu_curr = buffer_empty && lsu_valid;
-    assign grant_fma_curr = buffer_empty && !lsu_valid && fma_valid;
-    assign grant_alu_curr = buffer_empty && !lsu_valid && !fma_valid && alu_writeback_valid;
-    assign grant_special_reg_curr = buffer_empty && !lsu_valid && !fma_valid && !alu_writeback_valid && special_reg_valid;
+                .push(fifo_push[s]),
+                .addr(in_addr[s]),
+                .data(in_data[s]),
 
-    // Write is enabled if any of the data sources are granted access to the rf write port
+                .pop(fifo_pop[s]),
+                .head_addr(head_addr[s]),
+                .head_data(head_data[s]),
 
-    assign rf_write_enable = grant_buffer || grant_lsu_curr || grant_fma_curr || grant_alu_curr || grant_special_reg_curr;
+                .empty(fifo_empty[s]),
+                .full(fifo_full[s])
+            );
+        end
+    endgenerate
 
-    // Output the address and data from the correct source
+    logic [3:0] cand_valid;
+    assign cand_valid = ~fifo_empty | in_valid;
 
-    assign rf_write_addr = grant_buffer   ? buffer_head_addr :
-                           grant_lsu_curr ? lsu_addr :
-                           grant_fma_curr ? fma_addr :
-                           grant_alu_curr ? alu_addr :
-                           grant_special_reg_curr ? special_reg_addr :
-                           10'bx;
+    // Round-robin between sources, starting from rr_ptr
+    logic [1:0] rr_ptr, winner, idx;
+    logic win_valid;
 
-    assign rf_write_data = grant_buffer   ? buffer_head_data :
-                           grant_lsu_curr ? lsu_data :
-                           grant_fma_curr ? fma_data :
-                           grant_alu_curr ? alu_data :
-                           grant_special_reg_curr ? special_reg_data :
-                           32'bx;
+    always_comb begin
+        winner = rr_ptr;
+        win_valid = 1'b0;
 
-    // The data from each source is pushed to the FIFO if it wasn't written this cycle
-    // Pop from a FIFO if its data is written to the register
+        // Checked from lowest to highest priority, so rr_ptr itself wins if valid
+        for (int k = 3; k >= 0; --k) begin
+            idx = rr_ptr + k[1:0];
+            if (cand_valid[idx]) begin
+                winner = idx;
+                win_valid = 1'b1;
+            end
+        end
+    end
 
-    logic lsu_push, fma_push, alu_push, special_reg_push;
-    logic buffer_pop;
+    always_ff @(posedge clk) begin
+        if (reset)
+            rr_ptr <= '0;
+        else if (win_valid)
+            rr_ptr <= winner + 2'd1;
+    end
 
-    assign lsu_push = !buffer_full && lsu_valid && !grant_lsu_curr;
-    assign fma_push = !buffer_full && fma_valid && !grant_fma_curr;
-    assign alu_push = !buffer_full && alu_writeback_valid && !grant_alu_curr;
-    assign special_reg_push = !buffer_full && special_reg_valid && !grant_special_reg_curr;
+    always_comb begin
+        for (int i = 0; i < 4; ++i) begin
+            fifo_pop[i] = win_valid && (winner == i[1:0]) && !fifo_empty[i];
+            fifo_push[i] = in_valid[i] && !(win_valid && (winner == i[1:0]) && fifo_empty[i]);
+        end
+    end
 
-    assign buffer_pop = grant_buffer;
+    logic [3:0][9:0] cand_addr;
+    logic [3:0][31:0] cand_data;
 
-    writeback_fifo #(.DEPTH(16)) buffer (
-        .clk(clk),
-        .reset(reset),
-        
-        .lsu_push(lsu_push),
-        .lsu_addr(lsu_addr),
-        .lsu_data(lsu_data),
+    always_comb begin
+        for (int i = 0; i < 4; ++i) begin
+            cand_addr[i] = fifo_empty[i] ? in_addr[i] : head_addr[i];
+            cand_data[i] = fifo_empty[i] ? in_data[i] : head_data[i];
+        end
+    end
 
-        .fma_push(fma_push),
-        .fma_addr(fma_addr),
-        .fma_data(fma_data),
+    assign rf_write_enable = win_valid;
 
-        .alu_push(alu_push),
-        .alu_addr(alu_addr),
-        .alu_data(alu_data),
+    always_comb begin
+        case (winner)
+            2'd0: {rf_write_addr, rf_write_data} = {cand_addr[0], cand_data[0]};
+            2'd1: {rf_write_addr, rf_write_data} = {cand_addr[1], cand_data[1]};
+            2'd2: {rf_write_addr, rf_write_data} = {cand_addr[2], cand_data[2]};
+            default: {rf_write_addr, rf_write_data} = {cand_addr[3], cand_data[3]};
+        endcase
+    end
 
-        .special_reg_push(special_reg_push),
-        .special_reg_addr(special_reg_addr),
-        .special_reg_data(special_reg_data),
-
-        .pop(buffer_pop),
-        .head_addr(buffer_head_addr),
-        .head_data(buffer_head_data),
-        
-        .empty(buffer_empty),
-        .full(buffer_full)
-    );
+    assign buffer_full = |fifo_full;
 endmodule

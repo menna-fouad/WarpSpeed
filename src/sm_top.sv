@@ -27,7 +27,9 @@ module sm_top (
 
     // read data channel
     input  logic [127:0] app_rd_data,
-    input  logic app_rd_data_valid
+    input  logic app_rd_data_valid,
+
+    output logic [3:0] kernel_state_leds
 );
     logic fetch_valid, wb_buffer_full, sub_warp_valid, have_ready;
     logic [1:0] sub_warp_cycle;
@@ -382,6 +384,8 @@ module sm_top (
                 .is_load(alu_is_load),
                 .is_store(alu_is_store),
 
+                .stall(wb_buffer_full),
+
                 .rf_write_addr(wb_rf_write_addr_arr[gi]),
                 .rf_write_data(wb_rf_write_data[gi]),
                 .rf_write_enable(wb_rf_write_enable[gi]),
@@ -410,6 +414,7 @@ module sm_top (
     logic [31:0] dcache_req_addr, dcache_wr_word_en;
     logic [1023:0] dcache_wr_data;
 
+    logic lsu_ready;
     logic txn_valid, txn_is_load, txn_last;
     logic [2:0] txn_warp;
     logic [4:0] txn_dst;
@@ -435,7 +440,8 @@ module sm_top (
         .req_write(dcache_req_write),
         .wr_data(dcache_wr_data),
         .wr_word_en(dcache_wr_word_en),
-        // output to load store unit
+        // load store unit interface
+        .lsu_ready(lsu_ready),
         .txn_valid(txn_valid),
         .txn_is_load(txn_is_load),
         .txn_last(txn_last),
@@ -476,7 +482,9 @@ module sm_top (
     logic [127:0] dcache_mem_wdata;
     logic [127:0] dcache_mem_rdata;
     logic dcache_mem_rvalid, dcache_mem_rlast;
-    logic flush_done; // sent to warp scheduler to mark kernel_done
+    logic flush_start, flush_done; // sent to warp scheduler to mark kernel_done
+    logic flush_done_req, flush_done_req_q;
+    assign flush_start = warps_done && !kernel_done;
 
     l1_cache dcache (
         .clk(sm_clk),
@@ -491,8 +499,8 @@ module sm_top (
         .rsp_valid(dcache_rsp_valid),
         .rsp_line(dcache_rsp_line),
         .rsp_id(),
-        .flush_start(warps_done && !kernel_done), // from warp_scheduler
-        .flush_done(flush_done),
+        .flush_start(flush_start && !flush_done_req_q), // from warp_scheduler
+        .flush_done(flush_done_req),
         .mem_req_valid(dcache_mem_req_valid),
         .mem_req_ready(dcache_mem_req_ready),
         .mem_req_write(dcache_mem_req_write),
@@ -505,6 +513,18 @@ module sm_top (
         .mem_rvalid(dcache_mem_rvalid),
         .mem_rlast(dcache_mem_rlast)
     );
+
+    always_ff @(posedge sm_clk) begin
+        if (sm_reset || kernel_start) begin
+            flush_done_req_q <= 1'b0;
+        end else if (!flush_done_req_q) begin
+            flush_done_req_q <= flush_done_req;
+        end
+    end
+
+    logic wr_wempty; // empty signals from cmd and wr CDC fifos
+
+    assign flush_done = flush_done_req_q && wr_wempty;
 
     logic [7:0] store_done;
 
@@ -528,7 +548,8 @@ module sm_top (
         .lsu_addr(lsu_reg_bank_addr),
         .lsu_data(lsu_result),
         // output to warp scheduler to clear warp
-        .store_done(store_done)
+        .store_done(store_done),
+        .lsu_ready(lsu_ready)
     );
 
     logic arb_cmd_ready, arb_wready, arb_rsp_valid, arb_rsp_last;
@@ -600,7 +621,7 @@ module sm_top (
 
     // write side: mem_arbiter, read side: mem_expander
 
-    logic wr_full, wr_pop, wr_empty;
+    logic wr_full, wr_empty, wr_pop;
     logic [127:0] wr_rdata;
     assign arb_wready = !wr_full;
 
@@ -610,6 +631,7 @@ module sm_top (
         .wen(arb_wvalid & arb_wready),
         .wdata(arb_wdata),
         .full(wr_full),
+        .wempty(wr_wempty),
         .rclk(mem_ui_clk),
         .rrst(mem_ui_reset),
         .ren(wr_pop),
@@ -664,4 +686,33 @@ module sm_top (
         .app_rd_data(app_rd_data), // rd data driven in testbench
         .app_rd_data_valid(app_rd_data_valid) // rd data valid driven in testbench
     );
+
+    logic running;
+    logic flushing;
+    logic done;
+
+    always_ff @(posedge sm_clk) begin
+        if (sm_reset) begin
+            running <= 1'b0;
+            flushing <= 1'b0;
+            done <= 1'b0;
+        end else if (kernel_start && !running && !flushing) begin
+            running <= 1'b1;
+            flushing <= 1'b0;
+            done <= 1'b0;
+        end else if (flush_start) begin
+            running <= 1'b0;
+            flushing <= 1'b1;
+            done <= 1'b0;
+        end else if (kernel_done) begin
+            running <= 1'b0;
+            flushing <= 1'b0;
+            done <= 1'b1;
+        end
+    end
+
+    assign kernel_state_leds[0] = !running && !flushing && !done;
+    assign kernel_state_leds[1] = running;
+    assign kernel_state_leds[2] = flushing;
+    assign kernel_state_leds[3] = done;
 endmodule

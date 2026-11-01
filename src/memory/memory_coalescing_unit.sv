@@ -21,7 +21,8 @@ module memory_coalescing_unit (
     output logic [1023:0] wr_data,
     output logic [31:0] wr_word_en,
 
-    // output to load store unit
+    // load store unit interface
+    input logic lsu_ready,
     output logic txn_valid,
     output logic txn_is_load,
     output logic txn_last,
@@ -36,6 +37,12 @@ module memory_coalescing_unit (
         READY,
         ISSUING
     } slot_state_t;
+
+    typedef enum logic [1:0] {
+        IDLE,
+        BUILD,
+        ISSUE
+    } issue_state_t;
 
     // Per-warp instruction storage
     //    [warp][thread][data]
@@ -52,6 +59,7 @@ module memory_coalescing_unit (
 
     // Current state of each warp's slot
     slot_state_t slot_state [7:0]; // current state for each warp
+    issue_state_t issue_state;
 
     logic [7:0][2:0] ready_fifo;
     logic [3:0] ready_count;
@@ -74,16 +82,15 @@ module memory_coalescing_unit (
 
     logic fifo_push, fifo_pop;
     logic [2:0] issuing_warp;
-    logic issue_active;
     logic issue_done;
     logic direct_handoff;
 
     assign issue_done = req_valid && req_ready && txn_last;
 
     assign fifo_push = sub_warp_valid && (is_load || is_store) && (&sub_warp_cycle);
-    assign fifo_pop = |ready_count && (!issue_active || issue_done);
+    assign fifo_pop = |ready_count && issue_done;
 
-    assign direct_handoff = (ready_count == 0) && fifo_push && (issue_done || !issue_active);
+    assign direct_handoff = (ready_count == 0) && fifo_push && (issue_done || (issue_state == IDLE));
 
     always_ff @(posedge clk) begin
         if (reset)
@@ -118,7 +125,6 @@ module memory_coalescing_unit (
     always_ff @(posedge clk) begin        
         if (reset) begin
             issuing_warp <= 3'b0;
-            issue_active <= 1'b0;
 
             for (int w = 0; w < 8; ++w) begin
                 slot_state[w] <= EMPTY;
@@ -134,14 +140,10 @@ module memory_coalescing_unit (
 
             if (fifo_pop) begin
                 issuing_warp <= ready_fifo[0];
-                issue_active <= 1'b1;
                 slot_state[ready_fifo[0]] <= ISSUING;
             end else if (direct_handoff) begin
                 issuing_warp <= incoming_warp;
-                issue_active <= 1'b1;
                 slot_state[incoming_warp] <= ISSUING;
-            end else if (issue_done) begin
-                issue_active <= 1'b0;
             end
 
             if (req_valid && req_ready) begin
@@ -161,6 +163,45 @@ module memory_coalescing_unit (
     logic [24:0] selected_line;
     logic [31:0] group_mask;
 
+    logic [1:0] build_idx;
+    logic [31:0] wr_word_en_q;
+    logic [1023:0] wr_data_q;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            build_idx <= 0;
+            wr_word_en_q <= '0;
+            issue_state <= IDLE;
+        end else if (fifo_pop || direct_handoff) begin
+            build_idx <= 0;
+            wr_word_en_q <= '0;
+            issue_state <= (fifo_pop && slot_is_store[ready_fifo[0]] || (~fifo_pop && direct_handoff && is_store)) ?
+                            BUILD :
+                            ISSUE;
+        end else begin
+            case (issue_state)
+                BUILD : begin
+                    for (int i = 0; i < 8; ++i) begin
+                        if (group_mask[{build_idx, i[2:0]}]) begin
+                            wr_data_q[slot_addr[issuing_warp][{build_idx, i[2:0]}][6:2]*32 +: 32] <= slot_store_data[issuing_warp][{build_idx, i[2:0]}];
+                            wr_word_en_q[slot_addr[issuing_warp][{build_idx, i[2:0]}][6:2]] <= 1'b1;
+                        end
+                    end
+                    build_idx <= build_idx + 1;
+                    if (build_idx == 2'd3) issue_state <= ISSUE;
+                end
+
+                ISSUE : if (txn_valid) begin
+                    build_idx <= 0;
+                    wr_word_en_q <= '0;
+                    issue_state <= txn_last ? IDLE :
+                                    slot_is_store[issuing_warp] ? BUILD :
+                                    ISSUE;
+                end
+            endcase
+        end
+    end
+
     always_comb begin
         remaining = slot_mask[issuing_warp] & ~slot_claimed[issuing_warp];
         
@@ -178,18 +219,11 @@ module memory_coalescing_unit (
         for (int t = 0; t < 32; ++t)
             group_mask[t] = remaining[t] && (slot_addr[issuing_warp][t][31:7] == selected_line);
         
-        req_valid = issue_active && selected_thread_valid;
+        req_valid = (issue_state == ISSUE) && selected_thread_valid && lsu_ready;
         req_addr = {selected_line, 7'b0};
         req_write = slot_is_store[issuing_warp];
-
-        wr_data = '0;
-        wr_word_en = '0;
-        for (int t = 0; t < 32; ++t) begin
-            if (group_mask[t]) begin
-                wr_data[slot_addr[issuing_warp][t][6:2] * 32 +: 32] = slot_store_data[issuing_warp][t];
-                wr_word_en[slot_addr[issuing_warp][t][6:2]] = 1'b1;
-            end
-        end
+        wr_data = wr_data_q;
+        wr_word_en = wr_word_en_q;
 
         txn_valid = req_valid && req_ready;
         txn_is_load = !slot_is_store[issuing_warp];

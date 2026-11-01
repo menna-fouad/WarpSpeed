@@ -21,6 +21,7 @@ module final_integration_tb;
     
     logic app_rd_data_valid;
     logic [127:0] app_rd_data;
+    logic [3:0] kernel_state_leds;
 
     sm_top u_sm_top (.*);
 

@@ -11,6 +11,7 @@ module cdc_fifo #(
     input logic wen,
     input logic [DATA_WIDTH-1:0] wdata,
     output logic full,
+    output logic wempty,
 
     // read interface
     input logic rclk,
@@ -37,6 +38,7 @@ module cdc_fifo #(
             rgray_sync1 <= '0;
             rgray_sync2 <= '0;
             full <= 1'b0;
+            wempty <= 1'b1;
         end else begin
             if (wen && !full) 
                 mem[wptr[POINTER_WIDTH-1:0]] <= wdata;
@@ -48,6 +50,7 @@ module cdc_fifo #(
             rgray_sync2 <= rgray_sync1;
 
             full <= (wgray_next == {~rgray_sync2[POINTER_WIDTH:POINTER_WIDTH-1], rgray_sync2[POINTER_WIDTH-2:0]});
+            wempty <= (wgray_next == rgray_sync2);
         end
     end
 

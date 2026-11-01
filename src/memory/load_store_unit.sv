@@ -27,7 +27,8 @@ module load_store_unit (
     // output to warp scheduler to clear warp
     // issuing a store instruction since it
     // doesn't write a result to a register
-    output logic [7:0] store_done
+    output logic [7:0] store_done,
+    output logic lsu_ready
 );
     logic outstanding_valid;
     logic outstanding_is_load;
@@ -37,7 +38,6 @@ module load_store_unit (
     logic [31:0] outstanding_match_mask;
     logic [31:0][4:0] outstanding_word_sel;
 
-    logic [7:0][31:0][31:0] slot_data;
     logic [7:0][31:0] slot_mask;
     logic [7:0][4:0] slot_dst;
 
@@ -61,11 +61,25 @@ module load_store_unit (
     end
 
     logic wb_done;
+    logic [2:0] wb_warp;
+    logic [1:0] wb_group;
+
+    logic [2:0] rsp_warp_q;
+    logic [4:0] rsp_dst_q;
+    logic rsp_last_q;
+
+    logic [31:0] rsp_match_mask_q;
+    logic [31:0][4:0] rsp_word_sel_q;
+    logic [1023:0] rsp_line_q;
+
+    logic rsp_processing;
+    logic [1:0] rsp_group;
 
     // accumulate warp data from data cache response
     always_ff @(posedge clk) begin
         if (reset) begin
             slot_mask <= '0;
+            rsp_processing <= 1'b0;
         end else begin
             if (wb_done)
                 slot_mask[wb_warp] <= '0;
@@ -74,32 +88,64 @@ module load_store_unit (
                 slot_dst[outstanding_warp] <= outstanding_dst;
                 slot_mask[outstanding_warp] <= slot_mask[outstanding_warp] | outstanding_match_mask;
 
-                for (int t = 0; t < 32; ++t) begin
-                    if (outstanding_match_mask[t]) begin
-                        slot_data[outstanding_warp][t] <= rsp_line[outstanding_word_sel[t]*32 +: 32];
-                    end
-                end
+                rsp_warp_q <= outstanding_warp;
+                rsp_dst_q <= outstanding_dst;
+                rsp_last_q <= outstanding_last;
+
+                rsp_match_mask_q <= outstanding_match_mask;
+                rsp_word_sel_q <= outstanding_word_sel;
+                rsp_line_q <= rsp_line;
+
+                rsp_processing <= 1'b1;
+                rsp_group <= 2'd0;
+            end else if (rsp_processing) begin
+                if (rsp_group == 2'd3) rsp_processing <= 1'b0;
+                else rsp_group <= rsp_group + 2'd1;
             end
         end
     end
 
-    logic txn_complete;
-    assign txn_complete = outstanding_valid && outstanding_last && rsp_valid;
+    // Load data is staged in one LUTRAM per lane, addressed by {warp, group}
+    // Thread t lives in lane t % 8 at group t / 8, so the gather writes one entry per lane
+    // per cycle and the writeback reads one entry per lane per cycle
+    logic [7:0][31:0] slot_rd_data;
+
+    genvar l;
+    generate
+        for (l = 0; l < 8; ++l) begin : g_slot_ram
+            localparam logic [2:0] LANE = l;
+
+            (* ram_style = "distributed" *) logic [31:0] slot_data [0:31];
+
+            always_ff @(posedge clk) begin
+                if (rsp_processing && rsp_match_mask_q[{rsp_group, LANE}])
+                    slot_data[{rsp_warp_q, rsp_group}] <= rsp_line_q[rsp_word_sel_q[{rsp_group, LANE}]*32 +: 32];
+            end
+
+            assign slot_rd_data[l] = slot_data[{wb_warp, wb_group}];
+        end
+    endgenerate
+
+    logic store_complete, load_complete;
+    assign load_complete = rsp_processing && (&rsp_group) && rsp_last_q;
+    assign store_complete = outstanding_valid && outstanding_last && rsp_valid && !outstanding_is_load;
+
+    assign lsu_ready = !(rsp_valid && outstanding_valid && outstanding_is_load) &&
+                       !(rsp_processing && rsp_group == 2'd0);
+
     always_comb begin
         store_done = '0;
 
-        if (txn_complete && !outstanding_is_load)
+        if (store_complete)
             store_done[outstanding_warp] = 1'b1;
     end
 
     logic [7:0][2:0] ready_fifo;
     logic [3:0] ready_count;
     logic fifo_push, fifo_pop, direct_handoff;
-    logic wb_active; // wb_done declare above
-    logic [2:0] wb_warp;
-    logic [1:0] wb_group;
-    
-    assign fifo_push = txn_complete && outstanding_is_load;
+    logic wb_active; // wb_done, wb_warp, wb_group declared above
+
+    assign fifo_push = load_complete;
     assign fifo_pop = |ready_count && (!wb_active || wb_done);
 
     assign direct_handoff = ~|ready_count && fifo_push && (wb_done || !wb_active);
@@ -110,7 +156,7 @@ module load_store_unit (
         else begin
             case ({fifo_push && !direct_handoff, fifo_pop})
                 2'b10 : begin // push only
-                    ready_fifo[ready_count] <= outstanding_warp;
+                    ready_fifo[ready_count] <= rsp_warp_q;
                     ready_count <= ready_count + 4'd1;
                 end
 
@@ -125,7 +171,7 @@ module load_store_unit (
                     for (int i = 0; i < 7; ++i)
                         ready_fifo[i] <= ready_fifo[i + 1];
                     
-                    ready_fifo[ready_count - 1] <= outstanding_warp;
+                    ready_fifo[ready_count - 1] <= rsp_warp_q;
                     // ready_count doesn't change since one left and one entered
                 end
 
@@ -142,7 +188,7 @@ module load_store_unit (
         end else begin
             if (fifo_pop || direct_handoff) begin
                 wb_active <= 1'b1;
-                wb_warp <= fifo_pop ? ready_fifo[0] : outstanding_warp;
+                wb_warp <= fifo_pop ? ready_fifo[0] : rsp_warp_q;
                 wb_group <= 1'b0;
             end else if (wb_done) begin
                 wb_active <= 1'b0;
@@ -157,9 +203,9 @@ module load_store_unit (
         lsu_data = '0;
 
         if (wb_active && !wb_buffer_full) begin
-            for (int l = 0; l < 8; ++l) begin
-                lsu_valid[l] = slot_mask[wb_warp][8*wb_group + l];
-                lsu_data[l] = slot_data[wb_warp][8*wb_group + l];
+            for (int i = 0; i < 8; ++i) begin
+                lsu_valid[i] = slot_mask[wb_warp][8*wb_group + i];
+                lsu_data[i] = slot_rd_data[i];
             end
         end
 
