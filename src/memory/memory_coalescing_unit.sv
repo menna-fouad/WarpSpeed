@@ -38,8 +38,11 @@ module memory_coalescing_unit (
         ISSUING
     } slot_state_t;
 
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         IDLE,
+        COPY,
+        SELECT_LINE,
+        PREPARE_GROUP,
         BUILD,
         ISSUE
     } issue_state_t;
@@ -51,7 +54,6 @@ module memory_coalescing_unit (
 
     //    [warp][thread]
     logic [7:0][31:0] slot_mask; // Active threads for this instruction
-    logic [7:0][31:0] slot_claimed; // Threads already included in accepted cache transactions
 
     // Instruction metadata
     logic [7:0] slot_is_store; // no need for slot_is_load since its simply ~slot_is_store
@@ -81,7 +83,7 @@ module memory_coalescing_unit (
     end
 
     logic fifo_push, fifo_pop;
-    logic [2:0] issuing_warp;
+    (* max_fanout = 32 *) logic [2:0] issuing_warp;
     logic issue_done;
     logic direct_handoff;
 
@@ -122,21 +124,15 @@ module memory_coalescing_unit (
         end
     end
 
-    always_ff @(posedge clk) begin        
+    always_ff @(posedge clk) begin
         if (reset) begin
             issuing_warp <= 3'b0;
 
-            for (int w = 0; w < 8; ++w) begin
+            for (int w = 0; w < 8; ++w)
                 slot_state[w] <= EMPTY;
-                slot_claimed[w] <= '0;
-            end
         end else begin
-            if (sub_warp_valid && (is_load || is_store)) begin
-                if (~|sub_warp_cycle)
-                    slot_claimed[incoming_warp] <= '0;
-
+            if (sub_warp_valid && (is_load || is_store))
                 slot_state[incoming_warp] <= (&sub_warp_cycle) ? READY : ACCUM;
-            end   
 
             if (fifo_pop) begin
                 issuing_warp <= ready_fifo[0];
@@ -146,94 +142,135 @@ module memory_coalescing_unit (
                 slot_state[incoming_warp] <= ISSUING;
             end
 
-            if (req_valid && req_ready) begin
-                if (!txn_last)
-                    slot_claimed[issuing_warp] <= slot_claimed[issuing_warp] | group_mask;
-                else
-                    slot_state[issuing_warp] <= EMPTY;
-            end
+            if (req_valid && req_ready && txn_last)
+                slot_state[issuing_warp] <= EMPTY;
         end
     end
 
-    logic [31:0] remaining;
+    logic [31:0][31:0] curr_addr;
+    logic [31:0][31:0] curr_store_data;
+    logic [31:0] curr_mask;
+    logic [31:0] curr_claimed; // threads already included in accepted cache transactions
+    logic curr_is_store;
+    logic [4:0] curr_dst;
+
+    logic [31:0] remaining, remaining_q;
 
     logic [4:0] selected_thread;
-    logic selected_thread_valid;
-    
+    logic selected_thread_valid, selected_thread_valid_q;
+
     logic [24:0] selected_line;
     logic [31:0] group_mask;
+
+    // Next group, registered in PREPARE_GROUP; BUILD, ISSUE and the outputs only use these
+    logic [31:0] group_mask_q;
+    logic [24:0] selected_line_q;
+    logic txn_last_q, group_valid_q;
 
     logic [1:0] build_idx;
     logic [31:0] wr_word_en_q;
     logic [1023:0] wr_data_q;
 
-    always_ff @(posedge clk) begin
-        if (reset) begin
-            build_idx <= 0;
-            wr_word_en_q <= '0;
-            issue_state <= IDLE;
-        end else if (fifo_pop || direct_handoff) begin
-            build_idx <= 0;
-            wr_word_en_q <= '0;
-            issue_state <= (fifo_pop && slot_is_store[ready_fifo[0]] || (~fifo_pop && direct_handoff && is_store)) ?
-                            BUILD :
-                            ISSUE;
-        end else begin
-            case (issue_state)
-                BUILD : begin
-                    for (int i = 0; i < 8; ++i) begin
-                        if (group_mask[{build_idx, i[2:0]}]) begin
-                            wr_data_q[slot_addr[issuing_warp][{build_idx, i[2:0]}][6:2]*32 +: 32] <= slot_store_data[issuing_warp][{build_idx, i[2:0]}];
-                            wr_word_en_q[slot_addr[issuing_warp][{build_idx, i[2:0]}][6:2]] <= 1'b1;
-                        end
-                    end
-                    build_idx <= build_idx + 1;
-                    if (build_idx == 2'd3) issue_state <= ISSUE;
-                end
+    issue_state_t issue_state_next;
 
-                ISSUE : if (txn_valid) begin
-                    build_idx <= 0;
-                    wr_word_en_q <= '0;
-                    issue_state <= txn_last ? IDLE :
-                                    slot_is_store[issuing_warp] ? BUILD :
-                                    ISSUE;
+    // Next-state logic
+    always_comb begin
+        issue_state_next = issue_state;
+        case (issue_state)
+            COPY          : issue_state_next = SELECT_LINE;
+            SELECT_LINE   : issue_state_next = PREPARE_GROUP;
+            PREPARE_GROUP : issue_state_next = curr_is_store ? BUILD : ISSUE;
+            BUILD         : if (build_idx == 2'd3) issue_state_next = ISSUE;
+            ISSUE         : if (txn_valid) issue_state_next = txn_last ? IDLE : SELECT_LINE;
+            default       : ;
+        endcase
+    end
+
+    // State register
+    always_ff @(posedge clk) begin
+        if (reset)
+            issue_state <= IDLE;
+        else if (fifo_pop || direct_handoff)
+            issue_state <= COPY;
+        else
+            issue_state <= issue_state_next;
+    end
+
+    always_ff @(posedge clk) begin
+        case (issue_state)
+            COPY : begin
+                curr_addr <= slot_addr[issuing_warp];
+                curr_store_data <= slot_store_data[issuing_warp];
+                curr_mask <= slot_mask[issuing_warp];
+                curr_claimed <= '0;
+                curr_is_store <= slot_is_store[issuing_warp];
+                curr_dst <= slot_dst[issuing_warp];
+            end
+
+            SELECT_LINE : begin
+                selected_thread_valid_q <= selected_thread_valid;
+                selected_line_q <= selected_line;
+                remaining_q <= remaining;
+            end
+
+            PREPARE_GROUP : begin
+                group_mask_q <= group_mask;
+                group_valid_q <= selected_thread_valid_q;
+                txn_last_q <= selected_thread_valid_q && (remaining_q == group_mask);
+
+                build_idx <= 0;
+                wr_word_en_q <= '0;
+            end
+
+            BUILD : begin
+                for (int i = 0; i < 8; ++i) begin
+                    if (group_mask_q[{build_idx, i[2:0]}]) begin
+                        wr_data_q[curr_addr[{build_idx, i[2:0]}][6:2]*32 +: 32] <= curr_store_data[{build_idx, i[2:0]}];
+                        wr_word_en_q[curr_addr[{build_idx, i[2:0]}][6:2]] <= 1'b1;
+                    end
                 end
-            endcase
-        end
+                build_idx <= build_idx + 1;
+            end
+
+            ISSUE : if (txn_valid)
+                curr_claimed <= curr_claimed | group_mask_q;
+
+            default : ;
+        endcase
     end
 
     always_comb begin
-        remaining = slot_mask[issuing_warp] & ~slot_claimed[issuing_warp];
-        
+        remaining = curr_mask & ~curr_claimed;
+
         selected_thread = 5'd0;
         selected_thread_valid = |remaining;
-        
+
         for (int t = 31; t >= 0; --t) begin
             if (remaining[t]) begin
                 selected_thread = t[4:0];
             end
         end
-        
-        selected_line = slot_addr[issuing_warp][selected_thread][31:7];
+
+        selected_line = curr_addr[selected_thread][31:7];
 
         for (int t = 0; t < 32; ++t)
-            group_mask[t] = remaining[t] && (slot_addr[issuing_warp][t][31:7] == selected_line);
-        
-        req_valid = (issue_state == ISSUE) && selected_thread_valid && lsu_ready;
-        req_addr = {selected_line, 7'b0};
-        req_write = slot_is_store[issuing_warp];
+            group_mask[t] = remaining_q[t] && (curr_addr[t][31:7] == selected_line_q);
+
+        req_valid = (issue_state == ISSUE) && group_valid_q && lsu_ready;
+        req_addr = {selected_line_q, 7'b0};
+        req_write = curr_is_store;
         wr_data = wr_data_q;
         wr_word_en = wr_word_en_q;
 
         txn_valid = req_valid && req_ready;
-        txn_is_load = !slot_is_store[issuing_warp];
+        txn_is_load = !curr_is_store;
         txn_warp = issuing_warp;
-        txn_dst = slot_dst[issuing_warp];
-        txn_match_mask = group_mask;
-        txn_last = selected_thread_valid && (remaining == group_mask);
+        txn_dst = curr_dst;
+        txn_match_mask = group_mask_q;
+        txn_last = txn_last_q;
 
         for (int t = 0; t < 32; ++t) begin
-            txn_word_sel[t] = slot_addr[issuing_warp][t][6:2];
+            txn_word_sel[t] = curr_addr[t][6:2];
         end
     end
 

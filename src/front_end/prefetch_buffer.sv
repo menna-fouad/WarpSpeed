@@ -31,10 +31,6 @@ module prefetch_buffer #(
     logic [IDX_W-1:0] next_warp_base;
     assign next_warp_base = IDX_W'(next_warp) * IDX_W'(DEPTH_PER_WARP);
 
-    logic [31:0] line_end_pc, valid_bound;
-    assign line_end_pc = {fill_pcs[31:7] + 1'b1, 7'b0};   // start of the NEXT 128B line
-    assign valid_bound = (fill_recon_pc < line_end_pc) ? fill_recon_pc : line_end_pc;
-
     always_ff @(posedge clk) begin
         if (reset || kernel_launch) begin
             valid <= 'b0;
@@ -46,7 +42,9 @@ module prefetch_buffer #(
             for (int j = 0; j < 4; ++j) begin
                 data[next_warp_base + j] <= fill_data[j*32 +: 32];
                 pcs[next_warp_base + j] <= fill_pcs [j*32 +: 32];
-                valid[next_warp_base + j] <= (fill_pcs[j*32 +: 32] < valid_bound);
+                // Same 128B line as fill_pcs[0] iff its word offset + j doesn't pass word 31
+                valid[next_warp_base + j] <= (fill_pcs[j*32 +: 32] < fill_recon_pc) &&
+                                             (fill_pcs[6:2] <= 5'(31 - j));
             end
         end else if (consume) begin
             logic is_branch_or_done;

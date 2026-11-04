@@ -20,6 +20,10 @@ module int_alu (
     output logic branch_taken,
     output logic [31:0] result,
 
+    output logic mul_valid,
+    output logic [31:0] mul_result,
+    output logic [9:0] mul_addr,
+
     // Output warp_id, thread_slot, and dest_register for writeback_arbiter
     // This is simply the input passed to the output
     output logic sub_warp_valid_out,
@@ -63,7 +67,6 @@ module int_alu (
                     NOP : result <= 32'b0;
                     ADD : result <= src1 + src2;
                     SUB : result <= src1 - src2;
-                    MUL : result <= src1 * src2;
                     AND : result <= src1 & src2;
                     OR  : result <= src1 | src2;
                     SLT : result <= $signed(src1) < $signed(src2);
@@ -97,6 +100,59 @@ module int_alu (
         end
     end
 
+    logic [31:0] a_low_b_low;
+    logic [15:0] a_low_b_high;
+    logic [15:0] a_high_b_low;
+    logic is_mul;
+
+    logic [9:0] mul_addr_temp;
+
+    // Operand registers, no reset so they pack into the DSP AREG/BREG.
+    // Keeps the slow BRAM read (reg_file) and the multiply in separate cycles.
+    logic [31:0] mul_a, mul_b;
+    logic is_mul_in;
+    logic [9:0] mul_addr_in;
+
+    always_ff @(posedge clk) begin
+        if (!buffer_full) begin
+            mul_a <= src1;
+            mul_b <= src2;
+            mul_addr_in <= reg_bank_addr_in;
+        end
+    end
+
+    logic [15:0] upper_sum;
+    assign upper_sum = a_low_b_low[31:16] + a_low_b_high + a_high_b_low;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            a_low_b_low <= '0;
+            a_low_b_high <= '0;
+            a_high_b_low <= '0;
+            mul_result <= '0;
+
+            mul_addr_temp <= '0;
+            mul_addr <= '0;
+
+            is_mul_in <= 1'b0;
+            is_mul <= 1'b0;
+            mul_valid <= 1'b0;
+        end else if (!buffer_full) begin
+            is_mul_in <= valid_in && (opcode == {R_TYPE, MUL});
+
+            // partial products
+            a_low_b_low <= mul_a[15:0] * mul_b[15:0];
+            a_low_b_high <= mul_a[15:0] * mul_b[31:16];
+            a_high_b_low <= mul_a[31:16] * mul_b[15:0];
+            is_mul <= is_mul_in;
+            mul_addr_temp <= mul_addr_in;
+
+            mul_result <= {upper_sum, a_low_b_low[15:0]};
+            mul_valid <= is_mul;
+            mul_addr <= mul_addr_temp;
+        end
+    end
+
     always_ff @(posedge clk) begin
         if (reset) begin
             sub_warp_cycle_out <= 2'b0;
@@ -115,7 +171,7 @@ module int_alu (
             is_branch <= (opcode[5:3] == BRANCH);
             is_load <= (opcode == {I_TYPE, LOAD});
             is_store <= (opcode == {I_TYPE, STORE});
-            valid_out <= valid_in;
+            valid_out <= valid_in && (opcode != {R_TYPE, MUL});
             branch_pc_out <= instr_pc;
             push2_pc_recon_offset <= offset[7:0];
             src2_out <= src2;

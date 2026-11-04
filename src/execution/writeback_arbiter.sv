@@ -6,18 +6,21 @@ module writeback_arbiter (
 
     // Results
     input logic [31:0] alu_data,
+    input logic [31:0] mul_data,
     input logic [31:0] fma_data,
     input logic [31:0] lsu_data,
     input logic [31:0] special_reg_data,
 
     // Register file addresses
     input logic [9:0] alu_addr,
+    input logic [9:0] mul_addr,
     input logic [9:0] fma_addr,
     input logic [9:0] lsu_addr,
     input logic [9:0] special_reg_addr,
 
     // Valid bits
     input logic alu_valid,
+    input logic mul_valid,
     input logic fma_valid,
     input logic lsu_valid,
     input logic special_reg_valid,
@@ -27,7 +30,7 @@ module writeback_arbiter (
     input logic is_load,
     input logic is_store,
 
-    // Global stall (OR of every lane's buffer_full)
+    // Global stall (registered OR of every lane's buffer_full)
     input logic stall,
 
     // Output address, data, and write enable to register bank
@@ -35,29 +38,30 @@ module writeback_arbiter (
     output logic [31:0] rf_write_data,
     output logic rf_write_enable,
 
-    // Backpressure — stall issue of instructions of this result type
+    // Backpressure — some FIFO has one slot left. sm_top registers the OR of these,
+    // so the stall lands a cycle late, and the last slot absorbs that cycle's push.
     output logic buffer_full
 );
     logic alu_writeback_valid;
     assign alu_writeback_valid = alu_valid && !is_branch && !is_load && !is_store;
 
     // Incoming results, indexed by source
-    logic [3:0] in_valid;
-    logic [3:0][9:0] in_addr;
-    logic [3:0][31:0] in_data;
+    logic [4:0] in_valid;
+    logic [4:0][9:0] in_addr;
+    logic [4:0][31:0] in_data;
 
-    assign in_valid = {special_reg_valid, alu_writeback_valid, fma_valid, lsu_valid} & {4{!stall}};
-    assign in_addr = {special_reg_addr, alu_addr, fma_addr, lsu_addr};
-    assign in_data = {special_reg_data, alu_data, fma_data, lsu_data};
+    assign in_valid = {special_reg_valid, alu_writeback_valid, mul_valid, fma_valid, lsu_valid} & {5{!stall}};
+    assign in_addr = {special_reg_addr, alu_addr, mul_addr, fma_addr, lsu_addr};
+    assign in_data = {special_reg_data, alu_data, mul_data, fma_data, lsu_data};
 
     // One FIFO per source
-    logic [3:0] fifo_push, fifo_pop, fifo_empty, fifo_full;
-    logic [3:0][9:0] head_addr;
-    logic [3:0][31:0] head_data;
+    logic [4:0] fifo_push, fifo_pop, fifo_empty, fifo_full, fifo_almost_full;
+    logic [4:0][9:0] head_addr;
+    logic [4:0][31:0] head_data;
 
     genvar s;
     generate
-        for (s = 0; s < 4; ++s) begin : g_fifo
+        for (s = 0; s < 5; ++s) begin : g_fifo
             writeback_fifo #(.DEPTH(16)) u_buffer (
                 .clk(clk),
                 .reset(reset),
@@ -71,66 +75,74 @@ module writeback_arbiter (
                 .head_data(head_data[s]),
 
                 .empty(fifo_empty[s]),
-                .full(fifo_full[s])
+                .full(fifo_full[s]),
+                .almost_full(fifo_almost_full[s])
             );
         end
     endgenerate
 
-    logic [3:0] cand_valid;
+    logic [4:0] cand_valid;
     assign cand_valid = ~fifo_empty | in_valid;
 
     // Round-robin between sources, starting from rr_ptr
-    logic [1:0] rr_ptr, winner, idx;
-    logic win_valid;
+    logic [4:0] rr_ptr;
+    logic [4:0] masked_requests, grant;
 
-    always_comb begin
-        winner = rr_ptr;
-        win_valid = 1'b0;
-
-        // Checked from lowest to highest priority, so rr_ptr itself wins if valid
-        for (int k = 3; k >= 0; --k) begin
-            idx = rr_ptr + k[1:0];
-            if (cand_valid[idx]) begin
-                winner = idx;
-                win_valid = 1'b1;
-            end
-        end
-    end
+    // Lowest requester at/after the pointer; if none, wrap and take the lowest overall
+    assign masked_requests = cand_valid & rr_ptr;
+    assign grant = (|masked_requests) ? (masked_requests & ~(masked_requests - 1))
+                                      : (cand_valid & ~(cand_valid - 1));
 
     always_ff @(posedge clk) begin
         if (reset)
-            rr_ptr <= '0;
-        else if (win_valid)
-            rr_ptr <= winner + 2'd1;
+            rr_ptr <= '1;
+        else if (|cand_valid)
+            rr_ptr <= ~(grant | (grant - 1));
     end
 
     always_comb begin
-        for (int i = 0; i < 4; ++i) begin
-            fifo_pop[i] = win_valid && (winner == i[1:0]) && !fifo_empty[i];
-            fifo_push[i] = in_valid[i] && !(win_valid && (winner == i[1:0]) && fifo_empty[i]);
+        for (int i = 0; i < 5; ++i) begin
+            fifo_pop[i] = grant[i] && !fifo_empty[i];
+            fifo_push[i] = in_valid[i] && !(grant[i] && fifo_empty[i]);
         end
     end
 
-    logic [3:0][9:0] cand_addr;
-    logic [3:0][31:0] cand_data;
+    logic [4:0][9:0] cand_addr;
+    logic [4:0][31:0] cand_data;
 
     always_comb begin
-        for (int i = 0; i < 4; ++i) begin
+        for (int i = 0; i < 5; ++i) begin
             cand_addr[i] = fifo_empty[i] ? in_addr[i] : head_addr[i];
             cand_data[i] = fifo_empty[i] ? in_data[i] : head_data[i];
         end
     end
 
-    assign rf_write_enable = win_valid;
+    logic rf_write_enable_next;
+    logic [9:0] rf_write_addr_next;
+    logic [31:0] rf_write_data_next;
+
+    assign rf_write_enable_next = |cand_valid;
 
     always_comb begin
-        case (winner)
-            2'd0: {rf_write_addr, rf_write_data} = {cand_addr[0], cand_data[0]};
-            2'd1: {rf_write_addr, rf_write_data} = {cand_addr[1], cand_data[1]};
-            2'd2: {rf_write_addr, rf_write_data} = {cand_addr[2], cand_data[2]};
-            default: {rf_write_addr, rf_write_data} = {cand_addr[3], cand_data[3]};
-        endcase
+        rf_write_addr_next = '0;
+        rf_write_data_next = '0;
+        for (int i = 0; i < 5; ++i) begin
+            rf_write_addr_next |= cand_addr[i] & {10{grant[i]}};
+            rf_write_data_next |= cand_data[i] & {32{grant[i]}};
+        end
     end
 
-    assign buffer_full = |fifo_full;
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            rf_write_enable <= 1'b0;
+            rf_write_addr <= '0;
+            rf_write_data <= '0;
+        end else begin
+            rf_write_enable <= rf_write_enable_next;
+            rf_write_addr <= rf_write_addr_next;
+            rf_write_data <= rf_write_data_next;
+        end
+    end
+
+    assign buffer_full = |fifo_almost_full;
 endmodule

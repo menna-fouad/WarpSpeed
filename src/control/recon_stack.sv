@@ -1,3 +1,5 @@
+`default_nettype none
+`timescale 1ns/1ps
 module recon_stack # (
     parameter int DEPTH = 8,
     parameter int POINTER_DEPTH = $clog2(DEPTH + 1)
@@ -18,7 +20,9 @@ module recon_stack # (
     input logic [31:0] push2_pc_taken,
     input logic [31:0] push2_pc_fallthrough,
     input logic [31:0] push2_recon_pc,
-    
+    input logic push2_skip_taken, // registered in mask_split_unit
+    input logic push2_skip_not_taken,
+
     input logic current_pc_valid, // asserted by whatever drives current_pc, only when this warp is selected
     input logic [31:0] current_pc, // fetch_stage's PC for this warp, compared against top's reconverge_pc
 
@@ -49,21 +53,16 @@ module recon_stack # (
 
     // Skip pushing a branch whose PC already equals the reconvergence point
     // That branch has an empty body and would pop again immediately anyway
+    // (compares done and registered in mask_split_unit)
 
-    assign skip_taken = (push2_pc_taken == push2_recon_pc || ~|push2_mask_taken);
-    assign skip_not_taken = (push2_pc_fallthrough == push2_recon_pc || ~|push2_mask_not_taken);
+    assign skip_taken = push2_skip_taken;
+    assign skip_not_taken = push2_skip_not_taken;
     assign push_count = (!skip_taken && !skip_not_taken) ? 2'd2 :
                         (skip_taken != skip_not_taken)   ? 2'd1 : 2'd0;
 
     always_ff @(posedge clk) begin
-        if (reset) begin
-            for (int i=0; i<DEPTH; ++i) begin
-                masks[i] <= 32'b0;
-                pcs[i] <= 32'b0;
-                recon_pcs[i] <= 32'b0;
-            end
-            next_free <= 'b0;
-        end else begin
+        if (reset) next_free <= 'b0;
+        else begin
             if (init_push) begin
                 masks[0] <= init_mask;
                 pcs[0] <= init_pc;
@@ -101,10 +100,12 @@ module recon_stack # (
                     end
                     default: ; // unreachable
                 endcase
-            end else if (pop_valid) begin
-                next_free <= next_free - 1;
-            end else if (current_pc_valid) begin
-                pcs[top_valid] <= current_pc;
+            end else begin
+                if (pop_valid)
+                    next_free <= next_free - 1;
+                
+                if (current_pc_valid)
+                    pcs[top_valid] <= current_pc;
             end
         end
     end

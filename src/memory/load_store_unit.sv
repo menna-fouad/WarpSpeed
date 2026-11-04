@@ -198,17 +198,30 @@ module load_store_unit (
         end
     end
 
+    logic [7:0] lsu_valid_next;
+    logic [7:0][31:0] lsu_data_next;
+
     always_comb begin
-        lsu_valid = '0;
-        lsu_data = '0;
+        lsu_valid_next = '0;
+        lsu_data_next = '0;
 
         if (wb_active && !wb_buffer_full) begin
             for (int i = 0; i < 8; ++i) begin
-                lsu_valid[i] = slot_mask[wb_warp][8*wb_group + i];
-                lsu_data[i] = slot_rd_data[i];
+                lsu_valid_next[i] = slot_mask[wb_warp][8*wb_group + i];
+                lsu_data_next[i] = slot_rd_data[i];
             end
         end
+    end
 
-        lsu_addr = {wb_warp, wb_group, slot_dst[wb_warp]};
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            lsu_valid <= 1'b0;
+            lsu_data <= '0;
+            lsu_addr <= '0;
+        end else if (!wb_buffer_full) begin
+            lsu_valid <= lsu_valid_next;
+            lsu_data <= lsu_data_next;
+            lsu_addr <= {wb_warp, wb_group, slot_dst[wb_warp]};
+        end
     end
 endmodule

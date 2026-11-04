@@ -27,6 +27,7 @@ module fetch_stage (
     output logic [31:0] seq_next_pc
 );
     logic [127:0] fill_pcs;
+    logic [31:0] fill_recon_pc; // recon_pc latched with fill_pcs at request time
     logic fill_valid, req_outstanding;
     logic request_active;
     logic buf_valid;
@@ -49,18 +50,19 @@ module fetch_stage (
         end
     end
     
-    always_comb begin
+    always_ff @(posedge clk) begin
         if (reset) begin
-            fill_valid = 1'b0;
-            fill_pcs = 128'b0;
-        end else begin
-            fill_valid = icache_rsp_valid;
+            fill_pcs <= 128'b0;
+        end else if (icache_req_valid && icache_ready) begin
             for (int i = 0; i < 4; ++i)  begin
                 // top_pc + 4 * i (top_pc, top_pc + 4, top_pc + 8, top_pc + 12)
-                fill_pcs[i*32 +: 32] = top_pc + (i << 2);
+                fill_pcs[i*32 +: 32] <= top_pc + (i << 2);
             end
+            fill_recon_pc <= recon_pc;
         end
     end
+
+    assign fill_valid = icache_rsp_valid && !reset;
     
     prefetch_buffer buffer (
         .clk(clk),
@@ -70,7 +72,7 @@ module fetch_stage (
         .fill_valid(fill_valid),
         .fill_data(icache_data),
         .fill_pcs(fill_pcs),
-        .fill_recon_pc(recon_pc),
+        .fill_recon_pc(fill_recon_pc),
         .consume(consume),
 
         .instr(instr),

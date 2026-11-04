@@ -31,7 +31,8 @@ module sm_top (
 
     output logic [3:0] kernel_state_leds
 );
-    logic fetch_valid, wb_buffer_full, sub_warp_valid, have_ready;
+    logic fetch_valid, sub_warp_valid, have_ready;
+    (* max_fanout = 64 *) logic wb_buffer_full;
     logic [1:0] sub_warp_cycle;
 
     sub_warp_counter u_sub_warp_counter (
@@ -91,10 +92,26 @@ module sm_top (
     logic [31:0] ms_push2_pc_taken;
     logic [31:0] ms_push2_pc_fallthrough;
     logic [31:0] ms_push2_recon_pc;
+    logic ms_push2_skip_taken, ms_push2_skip_not_taken;
 
-    // Current PC signals (to be connected later)
+    // Current PC signals
     logic seq_pc_valid;
     logic [31:0] seq_next_pc;
+
+    // Registered PC update into the recon stacks (one-hot per warp), taking the
+    // fetch path off the recon stack CE. The warp is instr_busy until commit,
+    // so nothing reads its stack top during the extra cycle.
+    logic [7:0] seq_pc_valid_q;
+    logic [31:0] seq_next_pc_q;
+
+    always_ff @(posedge sm_clk) begin
+        if (sm_reset)
+            seq_pc_valid_q <= '0;
+        else
+            seq_pc_valid_q <= {8{seq_pc_valid}} & (8'b1 << ws_next_warp);
+
+        seq_next_pc_q <= seq_next_pc;
+    end
 
     genvar gi;
     generate
@@ -112,8 +129,10 @@ module sm_top (
                 .push2_pc_taken(ms_push2_pc_taken),
                 .push2_pc_fallthrough(ms_push2_pc_fallthrough),
                 .push2_recon_pc(ms_push2_recon_pc),
-                .current_pc_valid(seq_pc_valid && (ws_next_warp == gi)),
-                .current_pc(seq_next_pc),
+                .push2_skip_taken(ms_push2_skip_taken),
+                .push2_skip_not_taken(ms_push2_skip_not_taken),
+                .current_pc_valid(seq_pc_valid_q[gi]),
+                .current_pc(seq_next_pc_q),
                 .top_mask(recon_top_mask_arr[gi]),
                 .top_pc(recon_top_pc_arr[gi]),
                 .top_recon_pc(recon_top_recon_pc_arr[gi]),
@@ -235,6 +254,10 @@ module sm_top (
     logic [7:0] alu_valid_out, alu_branch_taken;
     logic [7:0][31:0] alu_result;
 
+    logic [7:0] mul_valid_out;
+    logic [7:0][31:0] mul_result_arr;
+    logic [7:0][9:0] mul_addr_arr;
+
     logic [7:0] alu_is_branch_arr, alu_is_load_arr, alu_is_store_arr, alu_sub_warp_valid_arr;
     logic [7:0][1:0] alu_sub_warp_cycle_arr;
     logic [7:0][31:0] alu_branch_pc_arr;
@@ -261,6 +284,9 @@ module sm_top (
                 .valid_out(alu_valid_out[gi]),
                 .branch_taken(alu_branch_taken[gi]),
                 .result(alu_result[gi]),
+                .mul_valid(mul_valid_out[gi]),
+                .mul_result(mul_result_arr[gi]),
+                .mul_addr(mul_addr_arr[gi]),
                 
                 // outputs for writeback_arbiter
                 .sub_warp_valid_out(alu_sub_warp_valid_arr[gi]),
@@ -305,6 +331,8 @@ module sm_top (
         .push2_pc_taken(ms_push2_pc_taken),
         .push2_pc_fallthrough(ms_push2_pc_fallthrough),
         .push2_recon_pc(ms_push2_recon_pc),
+        .push2_skip_taken(ms_push2_skip_taken),
+        .push2_skip_not_taken(ms_push2_skip_not_taken),
         .recon_push2_valid(ms_push2_valid)
     );
 
@@ -366,16 +394,19 @@ module sm_top (
                 .reset(sm_reset),
 
                 .alu_data(alu_result[gi]),
+                .mul_data(mul_result_arr[gi]),
                 .fma_data(fma_result[gi]),
                 .lsu_data(lsu_result[gi]),
                 .special_reg_data(sp_reg_result[gi]),
 
                 .alu_addr(alu_reg_bank_addr),
+                .mul_addr(mul_addr_arr[0]),
                 .fma_addr(fma_reg_bank_addr),
                 .lsu_addr(lsu_reg_bank_addr),
                 .special_reg_addr(sp_reg_bank_addr),
 
                 .alu_valid(alu_valid_out[gi]),
+                .mul_valid(mul_valid_out[gi]),
                 .fma_valid(fma_valid_out[gi]),
                 .lsu_valid(lsu_valid_out[gi]),
                 .special_reg_valid(sp_reg_valid_out[gi]),
@@ -395,7 +426,12 @@ module sm_top (
         end
     endgenerate
 
-    assign wb_buffer_full = |wb_buffer_full_arr;
+    always_ff @(posedge sm_clk) begin
+        if (sm_reset)
+            wb_buffer_full <= 1'b0;
+        else
+            wb_buffer_full <= |wb_buffer_full_arr;
+    end
 
     commit_tracker u_commit_tracker (
         .clk(sm_clk),
@@ -484,7 +520,13 @@ module sm_top (
     logic dcache_mem_rvalid, dcache_mem_rlast;
     logic flush_start, flush_done; // sent to warp scheduler to mark kernel_done
     logic flush_done_req, flush_done_req_q;
-    assign flush_start = warps_done && !kernel_done;
+    // Registered to keep the finished -> warps_done chain off the dcache req_ready path
+    always_ff @(posedge sm_clk) begin
+        if (sm_reset)
+            flush_start <= 1'b0;
+        else
+            flush_start <= warps_done && !kernel_done;
+    end
 
     l1_cache dcache (
         .clk(sm_clk),

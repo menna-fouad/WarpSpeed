@@ -23,9 +23,12 @@ module mask_split_unit #(
 
     output logic [31:0] push2_mask_taken,
     output logic [31:0] push2_mask_not_taken,
-    output logic [31:0] push2_pc_taken,
-    output logic [31:0] push2_pc_fallthrough, // branch_pc + 4
-    output logic [31:0] push2_recon_pc, // branch_pc + push2_pc_recon_offset
+    (* max_fanout = 16 *) output logic [31:0] push2_pc_taken,
+    (* max_fanout = 16 *) output logic [31:0] push2_pc_fallthrough, // branch_pc + 4
+    (* max_fanout = 16 *) output logic [31:0] push2_recon_pc, // branch_pc + push2_pc_recon_offset
+
+    output logic push2_skip_taken,
+    output logic push2_skip_not_taken,
 
     // Per-warp valid bit, one-hot for currently executing warp
     output logic [NUM_WARPS-1:0] recon_push2_valid
@@ -33,41 +36,47 @@ module mask_split_unit #(
     logic accum_done;
     assign accum_done = (&sub_warp_cycle && sub_warp_valid);
 
+    // Next mask values, so the skip flags see the same masks that get registered
+    logic [31:0] mask_taken_next, mask_not_taken_next;
+
+    always_comb begin
+        mask_taken_next = push2_mask_taken;
+        mask_not_taken_next = push2_mask_not_taken;
+
+        if (is_branch && !buffer_full && sub_warp_valid) begin
+            mask_taken_next[sub_warp_cycle*8 +: 8] = is_valid & branch_taken_bits;
+            mask_not_taken_next[sub_warp_cycle*8 +: 8] = is_valid & ~branch_taken_bits;
+        end
+    end
+
     always_ff @(posedge clk) begin
         if (reset) begin
             push2_mask_taken <= 32'b0;
             push2_mask_not_taken <= 32'b0;
-        end else if (is_branch && !buffer_full) begin
-            case (sub_warp_cycle)
-                2'd0: begin
-                    push2_mask_taken[7:0] <= sub_warp_valid ? is_valid & branch_taken_bits : push2_mask_taken[7:0];
-                    push2_mask_not_taken[7:0] <= sub_warp_valid ? is_valid & ~branch_taken_bits : push2_mask_not_taken[7:0];
-                end
-                2'd1: begin
-                    push2_mask_taken[15:8] <= sub_warp_valid ? is_valid & branch_taken_bits : push2_mask_taken[15:8];
-                    push2_mask_not_taken[15:8] <= sub_warp_valid ? is_valid & ~branch_taken_bits : push2_mask_not_taken[15:8];
-                end
-                2'd2: begin
-                    push2_mask_taken[23:16] <= sub_warp_valid ? is_valid & branch_taken_bits : push2_mask_taken[23:16];
-                    push2_mask_not_taken[23:16] <= sub_warp_valid ? is_valid & ~branch_taken_bits : push2_mask_not_taken[23:16];
-                end
-                2'd3: begin
-                    push2_mask_taken[31:24] <= sub_warp_valid ? is_valid & branch_taken_bits : push2_mask_taken[31:24];
-                    push2_mask_not_taken[31:24] <= sub_warp_valid ? is_valid & ~branch_taken_bits : push2_mask_not_taken[31:24];
-                end
-            endcase
+        end else begin
+            push2_mask_taken <= mask_taken_next;
+            push2_mask_not_taken <= mask_not_taken_next;
         end
     end
+
+    logic [31:0] recon_pc_next;
+    assign recon_pc_next = branch_pc + {{24{push2_pc_recon_offset[7]}}, push2_pc_recon_offset};
 
     always_ff @(posedge clk) begin
         if (reset) begin
             push2_pc_taken <= 32'b0;
             push2_pc_fallthrough <= 32'b0;
             push2_recon_pc <= 32'b0;
+            push2_skip_taken <= 1'b1;
+            push2_skip_not_taken <= 1'b1;
         end else if (!buffer_full) begin
             push2_pc_taken <= pc_taken;
             push2_pc_fallthrough <= branch_pc + 32'd4;
-            push2_recon_pc <= branch_pc + {{24{push2_pc_recon_offset[7]}}, push2_pc_recon_offset};
+            push2_recon_pc <= recon_pc_next;
+
+            push2_skip_taken <= (pc_taken == recon_pc_next) || ~|mask_taken_next;
+            // branch_pc + 4 == branch_pc + offset only when the offset is 4
+            push2_skip_not_taken <= (push2_pc_recon_offset == 8'd4) || ~|mask_not_taken_next;
         end
     end
 

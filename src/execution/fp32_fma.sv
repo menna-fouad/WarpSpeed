@@ -41,13 +41,47 @@ module fp32_fma(
     assign mant3 = {1'b1, src3[22:0]};
 
     // Multiply src1 and src2
-    logic [47:0] mant_mul;
-    logic [8:0] exp_mul;
-    logic sign_mul;
+    logic [23:0] a_low_b_low, a_low_b_high, a_high_b_low, a_high_b_high;
+    logic [8:0] exp_partial;
+    logic sign_partial;
 
-    assign mant_mul = mant1 * mant2;
-    assign exp_mul = exp1 + exp2 - 127;
-    assign sign_mul = sign1 ^ sign2;
+    logic valid_partial;
+    logic [9:0] reg_bank_addr_partial;
+
+    logic [23:0] mant3_partial;
+    logic [7:0] exp3_partial;
+    logic sign3_partial;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            a_low_b_low <= '0;
+            a_low_b_high <= '0;
+            a_high_b_low <= '0;
+            a_high_b_high <= '0;
+            exp_partial <= '0;
+            sign_partial <= '0;
+            valid_partial <= '0;
+            reg_bank_addr_partial <= '0;
+            mant3_partial <= '0;
+            exp3_partial <= '0;
+            sign3_partial <= 1'b0;
+        end else if (!buffer_full) begin
+            a_low_b_low <= mant1[11:0] * mant2[11:0];
+            a_low_b_high <= mant1[11:0] * mant2[23:12];
+            a_high_b_low <= mant1[23:12] * mant2[11:0];
+            a_high_b_high <= mant1[23:12] * mant2[23:12];
+
+            exp_partial <= exp1 + exp2 - 127;
+            sign_partial <= sign1 ^ sign2;
+
+            valid_partial <= valid_in;
+            reg_bank_addr_partial <= reg_bank_addr_in;
+
+            mant3_partial <= mant3;
+            exp3_partial <= exp3;
+            sign3_partial <= sign3;
+        end
+    end
 
     logic valid_mul_q;
     logic [47:0] mant_mul_q;
@@ -69,14 +103,18 @@ module fp32_fma(
             exp3_q <= 8'b0;
             sign3_q <= 1'b0;
         end else if (!buffer_full) begin
-            valid_mul_q <= valid_in;
-            mant_mul_q <= mant_mul;
-            exp_mul_q <= exp_mul;
-            sign_mul_q <= sign_mul;
-            reg_bank_addr_q <= reg_bank_addr_in;
-            mant3_q <= mant3;
-            exp3_q <= exp3;
-            sign3_q <= sign3;
+            valid_mul_q <= valid_partial;
+            mant_mul_q <= {24'b0, a_low_b_low} +
+                        {12'b0, a_low_b_high, 12'b0} +
+                        {12'b0, a_high_b_low, 12'b0} +
+                        {a_high_b_high, 24'b0};
+
+            exp_mul_q <= exp_partial;
+            sign_mul_q <= sign_partial;
+            reg_bank_addr_q <= reg_bank_addr_partial;
+            mant3_q <= mant3_partial;
+            exp3_q <= exp3_partial;
+            sign3_q <= sign3_partial;
         end
     end
 

@@ -1,4 +1,4 @@
-# GPGPU Streaming Multiprocessor (SM)
+# ⚡ WarpSpeed ⚡
 
 A SystemVerilog implementation of the microarchitecture of a single **GPU Streaming Multiprocessor**, featuring a lockstep SIMT execution model, warp scheduling, latency hiding, branch divergence, a pipelined FP32 multiply-add (FMA) unit, memory coalescing, and a cache hierarchy connected to a DDR2-style memory interface. It also focuses on coordinating many execution units, handling timing, stalling, and a variable-latency memory system.
 

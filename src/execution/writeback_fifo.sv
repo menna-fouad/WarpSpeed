@@ -17,7 +17,8 @@ module writeback_fifo #(
     output logic [9:0] head_addr,
     output logic [31:0] head_data,
     output logic empty,
-    output logic full
+    output logic full,
+    output logic almost_full // one slot left
 );
     (* ram_style = "distributed" *) logic [41:0] mem [0:DEPTH-1];
     logic [PTR_DEPTH-1:0] rd_ptr, wr_ptr;
@@ -32,6 +33,7 @@ module writeback_fifo #(
 
     assign empty = ~|count_q; // (count_q == 0)
     assign full = (count_q == DEPTH);
+    assign almost_full = (count_q >= (DEPTH - 1));
 
     // only the pointers can reset
     always_ff @(posedge clk) begin
