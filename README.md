@@ -14,7 +14,7 @@ A SystemVerilog implementation of the microarchitecture of a single **GPU Stream
 | Resident warps | Up to 8 warps (32 threads each) |
 | Physical execution lanes | 8 (each warp issues over 4 sub-warp cycles) |
 | Register file | 32 × 32-bit per thread |
-| Arithmetic | 32-bit integer ALU and 4-stage simplified FP32 FMA |
+| Arithmetic | 32-bit integer ALU and 5-stage simplified FP32 FMA |
 | Warp scheduling | Greedy scheduling with lowest-ID fallback |
 | Divergence | Per-warp reconvergence stack (8 entries) |
 | L1 caches | 8 KiB I$ & 8 KiB D$, 4-way set-associative blocking cache |
@@ -29,7 +29,7 @@ A SystemVerilog implementation of the microarchitecture of a single **GPU Stream
 - **32 threads per warp, 8 physical lanes:** each instruction executes over four 8-thread sub-warps.
 - **Up to 8 resident warps:** the scheduler stays on a ready warp when possible, otherwise selects another ready warp using fixed-priority fallback.
 - **Hazard handling:** Every warp instruction marks its own warp not-ready until its results commit. Latency hiding is done via switch to another warp. `commit_tracker` tracks completion across all four sub-warps.
-- **Backpressure:** When a writeback buffer is full, execution units hold in-flight instructions' results and `sub_warp_counter` pauses to stop issuing new instructions.
+- **Backpressure:** When any writeback FIFO is down to its last free slot, execution units hold in-flight instructions' results and `sub_warp_counter` pauses to stop issuing new instructions. The stall is registered, so it lands a cycle late and the last slot absorbs that cycle's result.
 - **Prefetching:** per-warp instruction buffers reduce delays when switching warps.
 
 ### Control
@@ -39,7 +39,7 @@ A SystemVerilog implementation of the microarchitecture of a single **GPU Stream
 - `mask_split_unit` - Collects branch decisions across four sub-warps and generates taken/not-taken thread masks.
 
 - `recon_stack` - Maintains a per-warp SIMT stack storing the current PCs, active-thread masks, and reconvergence PCs to handle divergent branches.
-    - When pushing branch decisions, the parent entry is preserved while branches are pushed given that they have at least one active thread.
+    - When pushing branch decisions, the parent entry is preserved while branches are pushed given that they have at least one active thread and do not start at the reconvergence PC.
     - Popping occurs when the fetch PC reaches the top entry's reconvergence PC.
 
 ### Front end
@@ -65,10 +65,10 @@ A SystemVerilog implementation of the microarchitecture of a single **GPU Stream
     - The final sum is rounded to nearest-even using guard/round/sticky bits
     - Overflow saturates to infinity and underflow flushes to zero; NaN, infinity, and subnormal inputs are not handled
 
-- `writeback_arbiter` + `writeback_fifo` - Arbitrates between ALU, FMA, LSU, and special_register results to access the register bank while buffering unchosen, but valid, results
-    - FIFO supports 16 entries per lane
-    - Buffered results drain first since they come from older instructions
-    - Fixed priority when 2 or more instructions finish executing at the same time (LSU > FMA > ALU > special-reg)
+- `writeback_arbiter` + `writeback_fifo` - Arbitrates between ALU, MUL, FMA, LSU, and special_register results to access the register bank while buffering unchosen, but valid, results
+    - Each lane has one 16-entry FIFO per source (5 per lane)
+    - Within a source, buffered results drain first since they come from older instructions
+    - Round-robin between sources when 2 or more have a result ready at the same time
 
 - `commit_tracker` - Tracks register-file commits across all four sub-warps and signals instruction completion to the warp scheduler.
 
@@ -175,7 +175,7 @@ DONE
 
 The testbench monitors every register-file write: warp, thread, register, data value, and how many times each was written. It checks all of them against a reference model. Any missing or duplicate writeback, wrong value, or write from the wrong divergence path fails the test.
 
-The kernel completes in **4276 cycles** (including the final D$ flush) and passes with all **2,624** expected register writes matching.
+The kernel completes in **4,888 cycles** (including the final D$ flush) and passes with all **2,624** expected register writes matching.
 
 ## Repository Structure
 
@@ -188,7 +188,10 @@ src/
 ├── front_end/     # Fetch stage, prefetch buffer, decode stage, sub-warp control
 ├── memory/        # Coalescer, LSU, caches, CDC FIFOs, DDR2 interface
 ├── registers/     # Register file and special registers
-└── sm_top.sv      # Integrated streaming multiprocessor
+├── sm_top.sv      # Integrated streaming multiprocessor
+├── fpga_top.sv    # Integrates sm_top, MIG IP, and reference clock
+├── debounce.sv    # Push-button debouncer
+└── Nexys-A7-100T-Master.xdc   # Pin and clock constraints
 
 testbenches/       # Unit, subsystem, and full-SM tests
 ├── control/
@@ -233,5 +236,6 @@ This is a single-SM RTL project that may be expanded to include the following:
 ## Current Status & Next Steps
 
 - [x] Complete full `sm_top` integration tests for arithmetic, memory, divergence, and multi-warp workloads
-- [ ] Run FPGA synthesis, timing analysis, and hardware DDR2 validation
-- [ ] Measure performance & resource utilization on hardware
+- [x] Run FPGA synthesis and analysis (timing, resource utilization, and power) in Vivado (timing closed at 100 MHz)
+- [ ] Benchmark performance in simulation
+- [ ] Validate DDR2 and measure performance on hardware
