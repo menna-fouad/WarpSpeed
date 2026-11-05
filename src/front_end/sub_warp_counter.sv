@@ -10,10 +10,10 @@ module sub_warp_counter(
     output logic sub_warp_valid
 );
     logic hold_d;
+    logic waiting;
+
     assign hold_d = buffer_full || (sub_warp_cycle == 2'd3 && waiting);
     assign sub_warp_valid = !hold_d;
-
-    logic waiting;
 
     always_ff @(posedge clk) begin
         if (reset) begin

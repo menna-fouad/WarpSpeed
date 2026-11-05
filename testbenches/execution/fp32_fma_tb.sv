@@ -64,8 +64,8 @@ module fp32_fma_tb;
         logic held_valid;
         logic [9:0] held_addr;
 
-        logic [3:0] held_stage_valids;
-        logic [9:0] held_addr_mul, held_addr_align;
+        logic [4:0] held_stage_valids;
+        logic [9:0] held_addr_partial, held_addr_mul, held_addr_align;
         logic [9:0] held_addr_add;
 
         begin
@@ -76,12 +76,14 @@ module fp32_fma_tb;
             held_addr = reg_bank_addr_out;
 
             held_stage_valids = {
+                dut.valid_partial,
                 dut.valid_mul_q,
                 dut.valid_aligned_q,
                 dut.valid_add_q,
                 dut.norm_valid_q
             };
 
+            held_addr_partial = dut.reg_bank_addr_partial;
             held_addr_mul = dut.reg_bank_addr_q;
             held_addr_align = dut.reg_bank_addr_aligned_q;
             held_addr_add = dut.reg_bank_addr_add_q;
@@ -95,10 +97,12 @@ module fp32_fma_tb;
                 if (result !== held_result ||
                     valid_out !== held_valid ||
                     reg_bank_addr_out !== held_addr ||
-                    {dut.valid_mul_q,
+                    {dut.valid_partial,
+                    dut.valid_mul_q,
                     dut.valid_aligned_q,
                     dut.valid_add_q,
                     dut.norm_valid_q} !== held_stage_valids ||
+                    dut.reg_bank_addr_partial !== held_addr_partial ||
                     dut.reg_bank_addr_q !== held_addr_mul ||
                     dut.reg_bank_addr_aligned_q !== held_addr_align ||
                     dut.reg_bank_addr_add_q !== held_addr_add) begin
@@ -117,8 +121,8 @@ module fp32_fma_tb;
     endtask
 
     task automatic test_full_pipeline_stall;
-        logic [31:0] expected_results [0:3];
-        logic [9:0] expected_tags [0:3];
+        logic [31:0] expected_results [0:4];
+        logic [9:0] expected_tags [0:4];
 
         begin
             $display("\nTEST: Full pipeline stall");
@@ -127,13 +131,16 @@ module fp32_fma_tb;
             expected_results[1] = 32'h40900000; // 4.5
             expected_results[2] = 32'hC0900000; // -4.5
             expected_results[3] = 32'hC0B00000; // -5.5
+            expected_results[4] = 32'h40D00000; // 6.5
 
             expected_tags[0] = 10'h201;
             expected_tags[1] = 10'h202;
             expected_tags[2] = 10'h203;
             expected_tags[3] = 10'h204;
+            expected_tags[4] = 10'h205;
 
-            // Issue four consecutive operations.
+            // Issue five consecutive operations, one for each pipeline stage:
+            // partial -> mul -> aligned -> add -> norm
 
             @(negedge clk);
             valid_in = 1'b1;
@@ -156,14 +163,18 @@ module fp32_fma_tb;
             reg_bank_addr_in = expected_tags[3];
 
             @(negedge clk);
+            src1 = 32'h40400000;
+            reg_bank_addr_in = expected_tags[4];
+
+            @(negedge clk);
             valid_in = 1'b0;
             buffer_full = 1'b1;
 
-            // All four operations are now in the pipeline.
+            // All five stages now hold an operation, with the first at the output.
             check_stall(4);
 
-            // Verify that all four results emerge in order.
-            for (int i = 0; i < 4; i++) begin
+            // Verify that all five results emerge in order.
+            for (int i = 0; i < 5; i++) begin
                 if (i != 0) begin
                     @(posedge clk);
                     #1;
@@ -196,6 +207,7 @@ module fp32_fma_tb;
         clk = 0;
         reset = 1;
         valid_in = 0;
+        buffer_full = 0;
         src1 = 0; src2 = 0; src3 = 0;
         #10 reset = 0;
 

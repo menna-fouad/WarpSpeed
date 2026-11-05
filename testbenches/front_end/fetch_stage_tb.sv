@@ -63,11 +63,13 @@ module fetch_stage_tb;
     int rsp_latency = 2;
     logic icache_auto;
     int pending_count = -1;
+    logic [31:0] pending_addr;
     always @(posedge clk) begin
         if (reset) begin
             pending_count <= -1;
         end else if (icache_auto && icache_req_valid && icache_ready) begin
             pending_count <= rsp_latency;
+            pending_addr <= icache_addr;
         end else if (pending_count > 0) begin
             pending_count <= pending_count - 1;
         end else begin
@@ -77,7 +79,7 @@ module fetch_stage_tb;
     always_comb begin
         icache_rsp_valid = icache_auto && (pending_count == 0);
         for (int i = 0; i < 4; i++)
-            icache_data[i*32 +: 32] = imem(top_pc + 4*i);
+            icache_data[i*32 +: 32] = imem(pending_addr + 4*i);
     end
 
     int req_count = 0;
@@ -152,6 +154,7 @@ module fetch_stage_tb;
 
     task automatic set_warp(input [2:0] w, input [31:0] pc);
         @(negedge clk);
+        while (icache_req_valid || DUT.req_outstanding) @(negedge clk);
         warp_pc[w] = pc;
         next_warp = w;
         #1;
@@ -264,6 +267,20 @@ module fetch_stage_tb;
         do_consume();
         check(32'h0, 1'b0);
         recon_pc = 32'hFFFF_FFFF;
+
+        // 5b. A fill uses the PC and recon_pc from when its request was accepted
+        $display("\nFill uses the PC and reconvergence PC latched at request time");
+        set_warp(3'd7, 32'h1700);
+        recon_pc = 32'h1708;
+        tick();
+        warp_pc[7] = 32'h1780;
+        recon_pc = 32'hFFFF_FFFF;
+        wait_fetch();
+        check(32'h1700, 1'b1);
+        do_consume();
+        check(32'h1704, 1'b1);
+        do_consume();
+        check(32'h0, 1'b0);
 
         // 6. A branch or DONE invalidates the rest of the buffer
         $display("\nConsuming a branch invalidates the remaining entries");

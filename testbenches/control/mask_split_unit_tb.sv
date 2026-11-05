@@ -18,6 +18,7 @@ module mask_split_unit_tb;
     logic [31:0] push2_pc_taken;
     logic [31:0] push2_pc_fallthrough;
     logic [31:0] push2_recon_pc;
+    logic push2_skip_taken, push2_skip_not_taken;
     logic [7:0] recon_push2_valid;
 
     int errors = 0;
@@ -40,6 +41,8 @@ module mask_split_unit_tb;
         .push2_pc_taken(push2_pc_taken),
         .push2_pc_fallthrough(push2_pc_fallthrough),
         .push2_recon_pc(push2_recon_pc),
+        .push2_skip_taken(push2_skip_taken),
+        .push2_skip_not_taken(push2_skip_not_taken),
         .recon_push2_valid(recon_push2_valid)
     );
 
@@ -115,6 +118,9 @@ module mask_split_unit_tb;
         check(push2_pc_taken, 32'h0000_2000);
         check(push2_pc_fallthrough, 32'h0000_1004);
         check(push2_recon_pc, 32'h0000_1010);
+        $display("both paths have threads and distinct PCs => neither skipped");
+        check(push2_skip_taken, 1'b0);
+        check(push2_skip_not_taken, 1'b0);
 
         idle();
         @(posedge clk); #1;
@@ -167,6 +173,8 @@ module mask_split_unit_tb;
         check(recon_push2_valid, 8'b0000_0100);
         check(push2_mask_taken, 32'h4433_2211);
         check(push2_recon_pc, 32'h0000_4008);
+        check(push2_skip_taken, 1'b0);
+        check(push2_skip_not_taken, 1'b0);
         idle();
 
         // Test 4: a non-branch instruction never pushes
@@ -186,6 +194,59 @@ module mask_split_unit_tb;
         sub_warp_valid = 1'b0;
         @(posedge clk); #1;
         check(recon_push2_valid, 8'b0);
+        idle();
+
+        // Test 6: skip flags from PCs equal to the recon PC
+        $display("\nTest 6: offset 4 => fall-through is the recon PC, not-taken skipped");
+        branch_pc = 32'h0000_5000;
+        pc_taken = 32'h0000_5040;
+        push2_pc_recon_offset = 8'd4;
+        for (int c = 0; c < 4; c++)
+            drive_sub_warp(3'd4, c[1:0], 8'hFF, 8'h0F);
+        @(posedge clk); #1;
+        check(recon_push2_valid, 8'b0001_0000);
+        check(push2_pc_fallthrough, push2_recon_pc);
+        check(push2_skip_taken, 1'b0);
+        check(push2_skip_not_taken, 1'b1);
+        idle();
+
+        $display("\nTest 6b: branch target is the recon PC => taken skipped");
+        branch_pc = 32'h0000_6000;
+        pc_taken = 32'h0000_6010;
+        push2_pc_recon_offset = 8'd16;
+        for (int c = 0; c < 4; c++)
+            drive_sub_warp(3'd4, c[1:0], 8'hFF, 8'h0F);
+        @(posedge clk); #1;
+        check(push2_pc_taken, push2_recon_pc);
+        check(push2_skip_taken, 1'b1);
+        check(push2_skip_not_taken, 1'b0);
+        idle();
+
+        // Test 7: skip flags from empty masks, set by the last sub-warp's byte
+        $display("\nTest 7: every active lane taken => not-taken mask empty, skipped");
+        branch_pc = 32'h0000_7000;
+        pc_taken = 32'h0000_7080;
+        push2_pc_recon_offset = 8'd32;
+        drive_sub_warp(3'd6, 2'd0, 8'hFF, 8'hFF);
+        drive_sub_warp(3'd6, 2'd1, 8'hFF, 8'hFF);
+        drive_sub_warp(3'd6, 2'd2, 8'hFF, 8'hFF);
+        drive_sub_warp(3'd6, 2'd3, 8'hFF, 8'hFF);
+        @(posedge clk); #1;
+        check(push2_mask_not_taken, 32'h0);
+        check(push2_skip_taken, 1'b0);
+        check(push2_skip_not_taken, 1'b1);
+        idle();
+
+        $display("\nTest 7b: no lane taken, only the last byte has active lanes => taken skipped");
+        drive_sub_warp(3'd6, 2'd0, 8'h00, 8'h00);
+        drive_sub_warp(3'd6, 2'd1, 8'h00, 8'h00);
+        drive_sub_warp(3'd6, 2'd2, 8'h00, 8'h00);
+        drive_sub_warp(3'd6, 2'd3, 8'h80, 8'h00);
+        @(posedge clk); #1;
+        check(push2_mask_taken, 32'h0);
+        check(push2_mask_not_taken, 32'h8000_0000);
+        check(push2_skip_taken, 1'b1);
+        check(push2_skip_not_taken, 1'b0);
         idle();
 
         if (errors == 0)

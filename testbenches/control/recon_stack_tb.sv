@@ -5,6 +5,7 @@ module recon_stack_tb;
     logic [31:0] init_mask, init_pc, init_recon_pc;
     logic [31:0] push2_mask_taken, push2_mask_not_taken;
     logic [31:0] push2_pc_taken, push2_pc_fallthrough, push2_recon_pc;
+    logic push2_skip_taken, push2_skip_not_taken;
 
     logic current_pc_valid;
     logic [31:0] current_pc;
@@ -27,6 +28,8 @@ module recon_stack_tb;
         .push2_pc_taken(push2_pc_taken),
         .push2_pc_fallthrough(push2_pc_fallthrough),
         .push2_recon_pc(push2_recon_pc),
+        .push2_skip_taken(push2_skip_taken),
+        .push2_skip_not_taken(push2_skip_not_taken),
         .current_pc_valid(current_pc_valid),
         .current_pc(current_pc),
         .top_mask(top_mask),
@@ -45,6 +48,7 @@ module recon_stack_tb;
         init_mask = '0; init_pc = '0; init_recon_pc = '0;
         push2_mask_taken = '0; push2_mask_not_taken = '0;
         push2_pc_taken = '0; push2_pc_fallthrough = '0; push2_recon_pc = '0;
+        push2_skip_taken = 1'b1; push2_skip_not_taken = 1'b1;
         current_pc = '0;
         @(negedge clk);
         @(negedge clk);
@@ -111,6 +115,9 @@ module recon_stack_tb;
         push2_mask_taken = mask_taken; push2_mask_not_taken = mask_not_taken;
         push2_pc_taken = pc_taken; push2_pc_fallthrough = pc_fallthrough;
         push2_recon_pc = recon_pc;
+        // what mask_split_unit registers alongside the push2 data
+        push2_skip_taken = (pc_taken == recon_pc) || ~|mask_taken;
+        push2_skip_not_taken = (pc_fallthrough == recon_pc) || ~|mask_not_taken;
 
         #1; check_push2_done(exp_push2_done);
 

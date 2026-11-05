@@ -17,8 +17,15 @@ module memory_coalescing_unit_tb;
     logic [4:0] txn_dst;
     logic [31:0] txn_match_mask;
     logic [31:0][4:0] txn_word_sel;
+    logic lsu_ready;
 
     int error_count = 0;
+
+    // Cycles the issue FSM takes before it can present a request
+    localparam int LOAD_SETUP = 3;      // last sub-warp -> COPY -> SELECT_LINE -> PREPARE_GROUP -> ISSUE
+    localparam int STORE_SETUP = 7;     // +4 BUILD cycles before ISSUE
+    localparam int NEXT_LOAD_SETUP = 2; // accepted line -> SELECT_LINE -> PREPARE_GROUP -> ISSUE
+    localparam int NEXT_STORE_SETUP = 6;
 
     memory_coalescing_unit coalescing (.*);
 
@@ -85,6 +92,7 @@ module memory_coalescing_unit_tb;
 
         // Cache always accepts requests for this first test
         req_ready = 1'b1;
+        lsu_ready = 1'b1;
 
         // Reset
         repeat (2) tick();
@@ -105,6 +113,7 @@ module memory_coalescing_unit_tb;
         send_subwarp(3'd0, 5'd5, 2'd1, 1'b1, 1'b0, 8'hFF, test_addr[15:8], test_data[15:8]);
         send_subwarp(3'd0, 5'd5, 2'd2, 1'b1, 1'b0, 8'hFF, test_addr[23:16], test_data[23:16]);
         send_subwarp(3'd0, 5'd5, 2'd3, 1'b1, 1'b0, 8'hFF, test_addr[31:24], test_data[31:24]);
+        repeat (LOAD_SETUP) tick();
 
         check(req_valid === 1'b1, "req_valid should be asserted");
         check(req_addr === 32'h0000_1000, "req_addr should be cache-line base 0x1000");
@@ -150,8 +159,9 @@ module memory_coalescing_unit_tb;
         send_subwarp(3'd2, 5'd12, 2'd1, 1'b1, 1'b0, 8'hFF, test_addr[15:8], test_data[15:8]);
         send_subwarp(3'd2, 5'd12, 2'd2, 1'b1, 1'b0, 8'hFF, test_addr[23:16], test_data[23:16]);
         send_subwarp(3'd2, 5'd12, 2'd3, 1'b1, 1'b0, 8'hFF, test_addr[31:24], test_data[31:24]);
+        repeat (LOAD_SETUP) tick();
         
-        // The request should be visible immediately after the final subwarp is captured.
+        // The request is visible once the issue FSM reaches ISSUE.
         check(req_valid === 1'b1, "req_valid should be asserted");
         check(req_addr === 32'h0000_1000, "req_addr should be cache-line base 0x1000");
         check(req_write === 1'b0, "req_write should be 0 for a load");
@@ -162,12 +172,14 @@ module memory_coalescing_unit_tb;
         check(txn_match_mask === 32'h0000_00FF, "lower 8 threads should belong to the transaction");
         check(txn_last === 1'b0, "multiple transactions so first transaction should not be the last transaction");
 
-        tick(); // accept 0x2000 transaction
+        tick(); // accept 0x1000 transaction
+        repeat (NEXT_LOAD_SETUP) tick();
         check(req_addr === 32'h0000_2000, "req_addr should be cache-line base 0x2000");
         check(txn_match_mask === 32'h00FF_FF00, "second set of 8 threads should belong to the transaction");
         check(txn_last === 1'b0, "second transaction should not be the last transaction");
 
-        tick(); // accept 0x3000 transaction
+        tick(); // accept 0x2000 transaction
+        repeat (NEXT_LOAD_SETUP) tick();
         check(req_addr === 32'h0000_3000, "req_addr should be cache-line base 0x3000");
         check(txn_match_mask === 32'hFF00_0000, "second set of 8 threads should belong to the transaction");
         check(txn_last === 1'b1, "third transactions should be the last transaction");
@@ -200,8 +212,9 @@ module memory_coalescing_unit_tb;
         send_subwarp(3'd3, 5'd27, 2'd1, 1'b1, 1'b0, 8'h34, test_addr[15:8], test_data[15:8]);
         send_subwarp(3'd3, 5'd27, 2'd2, 1'b1, 1'b0, 8'h56, test_addr[23:16], test_data[23:16]);
         send_subwarp(3'd3, 5'd27, 2'd3, 1'b1, 1'b0, 8'h78, test_addr[31:24], test_data[31:24]);
+        repeat (LOAD_SETUP) tick();
 
-        // The request should be visible immediately after the final subwarp is captured.
+        // The request is visible once the issue FSM reaches ISSUE.
         check(req_valid === 1'b1, "req_valid should be asserted");
         check(req_addr === 32'h0000_1000, "req_addr should be cache-line base 0x1000");
         check(req_write === 1'b0, "req_write should be 0 for a load");
@@ -212,7 +225,8 @@ module memory_coalescing_unit_tb;
         check(txn_match_mask === 32'h0000_3412, "mask should apply to the transaction");
         check(txn_last === 1'b0, "multiple transactions so first transaction should not be the last transaction");
 
-        tick(); // accept 0x2000 transaction
+        tick(); // accept 0x1000 transaction
+        repeat (NEXT_LOAD_SETUP) tick();
         check(req_addr === 32'h0000_2000, "req_addr should be cache-line base 0x2000");
         check(txn_match_mask === 32'h7856_0000, "second mask should apply to the transaction");
         check(txn_last === 1'b1, "second transaction should be the last transaction");
@@ -241,6 +255,7 @@ module memory_coalescing_unit_tb;
         send_subwarp(3'd4, 5'd15, 2'd1, 1'b0, 1'b1, 8'hFF, test_addr[15:8], test_data[15:8]);
         send_subwarp(3'd4, 5'd15, 2'd2, 1'b0, 1'b1, 8'hFF, test_addr[23:16], test_data[23:16]);
         send_subwarp(3'd4, 5'd15, 2'd3, 1'b0, 1'b1, 8'hFF, test_addr[31:24], test_data[31:24]);
+        repeat (STORE_SETUP) tick();
 
         // Check cache request
         check(req_valid === 1'b1, "Store request should be valid");
@@ -275,6 +290,7 @@ module memory_coalescing_unit_tb;
         send_subwarp(3'd5, 5'd7, 2'd1, 1'b0, 1'b1, 8'hA5, test_addr[15:8], test_data[15:8]);
         send_subwarp(3'd5, 5'd7, 2'd2, 1'b0, 1'b1, 8'hA5, test_addr[23:16], test_data[23:16]);
         send_subwarp(3'd5, 5'd7, 2'd3, 1'b0, 1'b1, 8'hA5, test_addr[31:24], test_data[31:24]);
+        repeat (STORE_SETUP) tick();
 
         check(req_valid === 1'b1, "Partial store request should be valid");
         check(req_addr === 32'h0000_5000, "Partial store address");
@@ -305,6 +321,7 @@ module memory_coalescing_unit_tb;
         send_subwarp(3'd6, 5'd9, 2'd1, 1'b1, 1'b0, 8'hFF, test_addr[15:8], test_data[15:8]);
         send_subwarp(3'd6, 5'd9, 2'd2, 1'b1, 1'b0, 8'hFF, test_addr[23:16], test_data[23:16]);
         send_subwarp(3'd6, 5'd9, 2'd3, 1'b1, 1'b0, 8'hFF, test_addr[31:24], test_data[31:24]);
+        repeat (LOAD_SETUP) tick();
 
         repeat (3) begin
             check(req_valid === 1'b1, "Request must remain valid during stall");
@@ -338,6 +355,7 @@ module memory_coalescing_unit_tb;
         send_subwarp(3'd0, 5'd10, 2'd1, 1'b1, 1'b0, 8'hFF, test_addr[15:8], test_data[15:8]);
         send_subwarp(3'd0, 5'd10, 2'd2, 1'b1, 1'b0, 8'hFF, test_addr[23:16], test_data[23:16]);
         send_subwarp(3'd0, 5'd10, 2'd3, 1'b1, 1'b0, 8'hFF, test_addr[31:24], test_data[31:24]);
+        repeat (LOAD_SETUP) tick();
 
         check(req_addr === 32'h0000_7000, "Warp 0 first line");
 
@@ -357,11 +375,13 @@ module memory_coalescing_unit_tb;
         #1;
 
         tick(); // Warp 0 first line accepted
+        repeat (NEXT_LOAD_SETUP) tick();
         check(req_addr === 32'h0000_8000, "Warp 0 second line");
         check(txn_last === 1'b1, "Warp 0 second line is last");
 
         tick(); // Warp 0 finishes, FIFO pops warp 1
         check(txn_warp === 3'd1, "Warp 1 should start issuing");
+        repeat (LOAD_SETUP) tick();
         check(req_addr === 32'h0000_9000, "Warp 1 line");
 
         tick(); // Warp 1 finishes
@@ -401,8 +421,14 @@ module memory_coalescing_unit_tb;
         check(coalescing.ready_count === 4'd1, "Warp 4 should replace warp 3 in FIFO");
         check(coalescing.ready_fifo[0] === 3'd4, "Warp 4 should be at FIFO head");
 
+        repeat (LOAD_SETUP) tick();
+        check(req_valid === 1'b1, "Warp 3 request should be valid");
+
         tick(); // Warp 3 finishes, warp 4 takes over
         check(txn_warp === 3'd4, "Warp 4 should issue next");
+
+        repeat (LOAD_SETUP) tick();
+        check(req_valid === 1'b1, "Warp 4 request should be valid");
 
         tick();
         check(req_valid === 1'b0, "All warps should finish");
@@ -434,8 +460,70 @@ module memory_coalescing_unit_tb;
         check(txn_warp === 3'd6, "Direct handoff should select warp 6");
         check(coalescing.ready_count === 4'd0, "FIFO should remain empty");
 
+        repeat (LOAD_SETUP) tick();
+        check(req_valid === 1'b1, "Warp 6 request should be valid");
+
         tick();
         check(req_valid === 1'b0, "Direct handoff warp should finish");
+
+        $display("TEST 10: LSU backpressure");
+
+        for (int t = 0; t < 32; ++t)
+            test_addr[t] = 32'h0000_E000 + t*4;
+
+        lsu_ready = 1'b0;
+        send_subwarp(3'd7, 5'd8, 2'd0, 1'b1, 1'b0, 8'hFF, test_addr[7:0], test_data[7:0]);
+        send_subwarp(3'd7, 5'd8, 2'd1, 1'b1, 1'b0, 8'hFF, test_addr[15:8], test_data[15:8]);
+        send_subwarp(3'd7, 5'd8, 2'd2, 1'b1, 1'b0, 8'hFF, test_addr[23:16], test_data[23:16]);
+        send_subwarp(3'd7, 5'd8, 2'd3, 1'b1, 1'b0, 8'hFF, test_addr[31:24], test_data[31:24]);
+        repeat (LOAD_SETUP) tick();
+
+        repeat (3) begin
+            check(req_valid === 1'b0, "No request while the LSU is not ready");
+            check(txn_valid === 1'b0, "No transaction while the LSU is not ready");
+            tick();
+        end
+
+        lsu_ready = 1'b1;
+        #1;
+        check(req_valid === 1'b1, "Request should resume once the LSU is ready");
+        check(req_addr === 32'h0000_E000, "Address should survive the LSU stall");
+        check(txn_valid === 1'b1, "Transaction should be accepted once the LSU is ready");
+        tick();
+        check(req_valid === 1'b0, "Request should finish after acceptance");
+
+        $display("TEST 11: Store spanning two cache lines");
+
+        for (int t = 0; t < 32; ++t) begin
+            test_addr[t] = ((t < 16) ? 32'h0000_C000 : 32'h0000_D000) + t*4;
+            test_data[t] = 32'd300 + t;
+        end
+
+        send_subwarp(3'd1, 5'd3, 2'd0, 1'b0, 1'b1, 8'hFF, test_addr[7:0], test_data[7:0]);
+        send_subwarp(3'd1, 5'd3, 2'd1, 1'b0, 1'b1, 8'hFF, test_addr[15:8], test_data[15:8]);
+        send_subwarp(3'd1, 5'd3, 2'd2, 1'b0, 1'b1, 8'hFF, test_addr[23:16], test_data[23:16]);
+        send_subwarp(3'd1, 5'd3, 2'd3, 1'b0, 1'b1, 8'hFF, test_addr[31:24], test_data[31:24]);
+        repeat (STORE_SETUP) tick();
+
+        check(req_addr === 32'h0000_C000, "First store line");
+        check(req_write === 1'b1, "First line should be a write");
+        check(wr_word_en === 32'h0000_FFFF, "First line word enables");
+        check(txn_last === 1'b0, "First line should not be the last transaction");
+        for (int t = 0; t < 16; ++t)
+            check(wr_data[t*32 +: 32] === test_data[t], $sformatf("First line data at word %0d", t));
+
+        tick(); // accept the first line
+        repeat (NEXT_STORE_SETUP) tick();
+
+        check(req_addr === 32'h0000_D000, "Second store line");
+        check(wr_word_en === 32'hFFFF_0000, "Second line must not keep the first line's word enables");
+        check(txn_match_mask === 32'hFFFF_0000, "Second line match mask");
+        check(txn_last === 1'b1, "Second line should be the last transaction");
+        for (int t = 16; t < 32; ++t)
+            check(wr_data[t*32 +: 32] === test_data[t], $sformatf("Second line data at word %0d", t));
+
+        tick();
+        check(req_valid === 1'b0, "Store should finish after the second line");
 
         // Final result
         if (error_count == 0)

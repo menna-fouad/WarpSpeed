@@ -31,6 +31,11 @@ module writeback_arbiter_tb;
         .lsu_valid(lsu_valid),
         .special_reg_valid(special_reg_valid),
 
+        .is_branch(1'b0),
+        .is_load(1'b0),
+        .is_store(1'b0),
+        .stall(1'b0),
+
         .rf_write_addr(rf_write_addr),
         .rf_write_data(rf_write_data),
         .rf_write_enable(rf_write_enable),
@@ -73,6 +78,7 @@ module writeback_arbiter_tb;
         end
     endtask
 
+    // rf_write_* are registered, so results show up one edge after the inputs are driven
     task automatic tick;
         begin
             @(posedge clk);
@@ -93,9 +99,8 @@ module writeback_arbiter_tb;
         // 1. Nothing valid
         $display("\nTEST 1: Nothing valid");
         drive(0,0,0, 0,0,0, 0,0,0, 0,0,0);
-        check(0,0,0);
         tick();
-
+        check(0,0,0);
 
         // 2. Only ALU
         $display("\nTEST 2: Only ALU");
@@ -103,9 +108,8 @@ module writeback_arbiter_tb;
               0,0,0,
               0,0,0,
               0,0,0);
-        check(1,10'h001,32'hAAAA);
         tick();
-
+        check(1,10'h001,32'hAAAA);
 
         // 3. Only FMA
         $display("\nTEST 3: Only FMA");
@@ -113,9 +117,8 @@ module writeback_arbiter_tb;
               1,10'h002,32'hBBBB,
               0,0,0,
               0,0,0);
-        check(1,10'h002,32'hBBBB);
         tick();
-
+        check(1,10'h002,32'hBBBB);
 
         // 4. Only LSU
         $display("\nTEST 4: Only LSU");
@@ -123,53 +126,54 @@ module writeback_arbiter_tb;
               0,0,0,
               1,10'h003,32'hCCCC,
               0,0,0);
-        check(1,10'h003,32'hCCCC);
         tick();
+        check(1,10'h003,32'hCCCC);
 
+        // Arbitration is round-robin (source index: 0 = LSU, 1 = FMA, 2 = ALU, 3 = special reg),
+        // rr_ptr points one past the last winner. After TESTS 2-4 (ALU, FMA, LSU) rr_ptr = 1.
 
         // 5. LSU + ALU
-        // LSU wins, ALU goes into FIFO
+        // rr_ptr = 1 -> ALU wins, LSU goes into FIFO
         $display("\nTEST 5: LSU + ALU");
         drive(1,10'h010,32'hAAAA0010,
               0,0,0,
               1,10'h020,32'hBBBB0020,
               0,0,0);
-        check(1,10'h020,32'hBBBB0020);
         tick();
-
-
-        // ALU should now come from FIFO
-        $display("TEST 5.2: Buffered ALU");
-        drive(0,0,0, 0,0,0, 0,0,0, 0,0,0);
         check(1,10'h010,32'hAAAA0010);
+
+
+        // LSU should now come from FIFO
+        $display("TEST 5.2: Buffered LSU");
+        drive(0,0,0, 0,0,0, 0,0,0, 0,0,0);
         tick();
+        check(1,10'h020,32'hBBBB0020);
 
 
         // 6. All three valid
-        // LSU wins, FMA then ALU are buffered
+        // rr_ptr = 1 -> FMA wins, ALU then LSU are buffered
         $display("\nTEST 6: LSU + FMA + ALU");
         drive(1,10'h030,32'hAAAA0030,
               1,10'h040,32'hBBBB0040,
               1,10'h050,32'hCCCC0050,
               0,0,0);
 
-
-        // LSU should be first
-        check(1,10'h050,32'hCCCC0050);
+        // FMA should be first
         tick();
+        check(1,10'h040,32'hBBBB0040);
 
         drive(0,0,0, 0,0,0, 0,0,0, 0,0,0);
 
-        // FMA should be next
-        check(1,10'h040,32'hBBBB0040);
-        tick();
-
         // ALU should be next
-        check(1,10'h030,32'hAAAA0030);
         tick();
+        check(1,10'h030,32'hAAAA0030);
+
+        // LSU should be next
+        tick();
+        check(1,10'h050,32'hCCCC0050);
 
         // 7. Buffered data has priority over new LSU
-        // First create FMA + ALU in FIFO
+        // rr_ptr = 1 -> FMA wins, ALU + LSU go into FIFO
         $display("\nTEST 7: Buffered data vs new LSU");
 
         drive(1,10'h060,32'hAAAA0060,
@@ -177,30 +181,31 @@ module writeback_arbiter_tb;
               1,10'h080,32'hCCCC0080,
               0,0,0);
 
-        check(1,10'h080,32'hCCCC0080);
         tick();
+        check(1,10'h070,32'hBBBB0070);
 
-        // FIFO contains FMA + ALU.
-        // New LSU arrives, but FIFO wins.
+        // FIFO contains ALU + LSU.
+        // New LSU arrives and queues behind the buffered LSU, ALU wins this cycle.
         drive(0,0,0,
               0,0,0,
               1,10'h090,32'hDDDD0090,
               0,0,0);
 
-        check(1,10'h070,32'hBBBB0070);
         tick();
-
-
-        // ALU was already in FIFO
-        drive(0,0,0, 0,0,0, 0,0,0, 0,0,0);
         check(1,10'h060,32'hAAAA0060);
-        tick();
 
+        // Buffered LSU drains before the new one
+        drive(0,0,0, 0,0,0, 0,0,0, 0,0,0);
+        tick();
+        check(1,10'h080,32'hCCCC0080);
 
         // New LSU should be last
-        drive(0,0,0, 0,0,0, 0,0,0, 0,0,0);
-        check(1,10'h090,32'hDDDD0090);
         tick();
+        check(1,10'h090,32'hDDDD0090);
+
+        // Nothing left
+        tick();
+        check(0,0,0);
 
 
         // Done

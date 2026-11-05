@@ -156,8 +156,22 @@ module front_end_integration_tb;
     logic [7:0] push2_valid;
     logic [31:0] push2_mask_taken, push2_mask_not_taken;
     logic [31:0] push2_pc_taken, push2_pc_fallthrough, push2_recon_pc;
+    logic push2_skip_taken, push2_skip_not_taken;
     logic seq_pc_valid;
     logic [31:0] seq_next_pc;
+
+    // Registered PC update into the recon stacks
+    logic [7:0] seq_pc_valid_q;
+    logic [31:0] seq_next_pc_q;
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            seq_pc_valid_q <= '0;
+        else
+            seq_pc_valid_q <= {8{seq_pc_valid}} & (8'b1 << ws_next_warp);
+
+        seq_next_pc_q <= seq_next_pc;
+    end
 
     genvar gi;
     generate
@@ -175,8 +189,10 @@ module front_end_integration_tb;
                 .push2_pc_taken(push2_pc_taken),
                 .push2_pc_fallthrough(push2_pc_fallthrough),
                 .push2_recon_pc(push2_recon_pc),
-                .current_pc_valid(seq_pc_valid && (ws_next_warp == gi)),
-                .current_pc(seq_next_pc),
+                .push2_skip_taken(push2_skip_taken),
+                .push2_skip_not_taken(push2_skip_not_taken),
+                .current_pc_valid(seq_pc_valid_q[gi]),
+                .current_pc(seq_next_pc_q),
                 .top_mask(top_mask_arr[gi]),
                 .top_pc(top_pc_arr[gi]),
                 .top_recon_pc(top_recon_pc_arr[gi]),
@@ -324,6 +340,8 @@ module front_end_integration_tb;
             commit_done <= '0;
             push_at <= -1;
             push2_valid <= '0;
+            push2_skip_taken <= 1'b1;
+            push2_skip_not_taken <= 1'b1;
         end else begin
             commit_done <= '0;
             push2_valid <= '0;
@@ -358,6 +376,8 @@ module front_end_integration_tb;
                 push2_pc_taken <= push_pc_t;
                 push2_pc_fallthrough <= push_pc_ft;
                 push2_recon_pc <= push_pc_r;
+                push2_skip_taken <= (push_pc_t == push_pc_r) || ~|push_mask_t;
+                push2_skip_not_taken <= (push_pc_ft == push_pc_r) || ~|push_mask_nt;
                 push_at <= -1;
             end
         end

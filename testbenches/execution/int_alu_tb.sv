@@ -20,6 +20,9 @@ module int_alu_tb;
     logic [31:0] branch_pc_out;
     logic [7:0] push2_pc_recon_offset;
     logic [31:0] src2_out;
+    logic mul_valid;
+    logic [31:0] mul_result;
+    logic [9:0] mul_addr;
 
     int errors = 0;
 
@@ -39,6 +42,9 @@ module int_alu_tb;
         .valid_out(valid_out),
         .branch_taken(branch_taken),
         .result(result),
+        .mul_valid(mul_valid),
+        .mul_result(mul_result),
+        .mul_addr(mul_addr),
         .sub_warp_valid_out(sub_warp_valid_out),
         .sub_warp_cycle_out(sub_warp_cycle_out),
         .reg_bank_addr_out(reg_bank_addr_out),
@@ -155,9 +161,31 @@ module int_alu_tb;
         drive(SLT, -32'sd5, 32'd1, 32'b0, 16'b0);
         check_result(result, 32'd1);
 
+        // MUL goes down its own 3-cycle pipeline (operand regs -> partial products -> sum)
+        // and comes out on mul_valid/mul_result/mul_addr, not valid_out/result
         $display("MUL");
+        reg_bank_addr_in = 10'h155;
         drive(MUL, 32'd6, 32'd7, 32'b0, 16'b0);
-        check_result(result, 32'd42);
+        valid_in = 1'b0;
+        check_bit(valid_out, 1'b0);
+        check_bit(mul_valid, 1'b0);
+        @(posedge clk); #1;
+        check_bit(mul_valid, 1'b0);
+        @(posedge clk); #1;
+        check_bit(mul_valid, 1'b1);
+        check_result(mul_result, 32'd42);
+        check_result(mul_addr, 10'h155);
+        @(posedge clk); #1;
+        check_bit(mul_valid, 1'b0);
+
+        $display("MUL (upper partial products, low 32 bits kept)");
+        drive(MUL, 32'h12345678, 32'h9ABCDEF0, 32'b0, 16'b0);
+        valid_in = 1'b0;
+        repeat (2) @(posedge clk);
+        #1;
+        check_bit(mul_valid, 1'b1);
+        check_result(mul_result, 32'h242D2080);
+        reg_bank_addr_in = 10'b0;
 
         // I-type: the second operand is the 16-bit immediate, not src2
         $display("\nLUI");
