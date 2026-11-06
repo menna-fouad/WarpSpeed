@@ -34,6 +34,7 @@ module warp_scheduler #(
     // State for each warp
     logic [NUM_WARPS-1:0] ready;
     logic [NUM_WARPS-1:0] finished;
+    logic [NUM_WARPS-1:0] instr_busy; // warp has an instruction in flight
 
     // ready_mask is computed combinationall to show which warps are ready
     logic [NUM_WARPS-1:0] ready_mask, pick_mask;
@@ -44,8 +45,13 @@ module warp_scheduler #(
                             & ~(i == curr_warp & done_detect);                                // or this cycle
         end
         
+        // A warp with an instruction in flight can't be picked, unless it completes this cycle.
+        // The ready bit alone can't tell us this: a commit from an older instruction can set it
+        // while a newer one is staged or running, and picking that warp would block the front end.
+        for (int i = 0; i < NUM_WARPS; i++)
+            pick_mask[i] = ready_mask[i] & (~instr_busy[i] | commit_done[i] | store_done[i] | push2_done[i]);
+
         // The warp being issued this cycle can't be picked to go after itself
-        pick_mask = ready_mask;
         if (consume) pick_mask[next_warp] = 1'b0;
     end
 
@@ -96,8 +102,6 @@ module warp_scheduler #(
             issue_valid <= 1'b1;
         end
     end
-
-    logic [NUM_WARPS-1:0] instr_busy;
 
     always_ff @(posedge clk) begin
         if (reset || kernel_start) begin

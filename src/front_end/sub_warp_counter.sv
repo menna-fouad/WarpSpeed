@@ -21,11 +21,11 @@ module sub_warp_counter(
             waiting <= 1'b1;
         end else if (!buffer_full) begin
             if (sub_warp_cycle == 2'd3) begin
-                if (!waiting) begin
-                    waiting <= 1'b1; // Execute subwarp 3, then mark it completed.
-                end else if (fetch_valid && have_ready) begin
+                if (fetch_valid && have_ready) begin
                     sub_warp_cycle <= 2'd0;
                     waiting <= 1'b0;
+                end else begin
+                    waiting <= 1'b1;
                 end
             end else begin
                 sub_warp_cycle <= sub_warp_cycle + 2'd1;
