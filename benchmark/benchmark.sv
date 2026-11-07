@@ -34,6 +34,7 @@ module performance;
     int flush = 0;
     int commit_wait = 0;
     int fetch_wait = 0;
+    int empty_sub_warp = 0;
     int other = 0;
 
     sm_top u_sm_top (.*);
@@ -45,6 +46,7 @@ module performance;
             if (u_sm_top.wb_buffer_full) stall <= stall + 1;
             else if ((|u_sm_top.dec_alu_valid) | (|u_sm_top.dec_fma_valid) | (|u_sm_top.dec_special_reg_valid))
                 issue <= issue + 1;
+            else if (u_sm_top.dec_sub_warp_valid) empty_sub_warp <= empty_sub_warp + 1;
             else if (u_sm_top.warps_done) flush <= flush + 1;
             else if (|u_sm_top.u_warp_scheduler.instr_busy) commit_wait <= commit_wait + 1;
             else if (!u_sm_top.u_fetch.buf_valid) fetch_wait <= fetch_wait + 1;
@@ -66,6 +68,7 @@ module performance;
         flush = 0;
         commit_wait = 0;
         fetch_wait = 0;
+        empty_sub_warp = 0;
         other = 0;
     endtask
 
@@ -361,10 +364,31 @@ module performance;
         endcase
     endtask
 
+    function automatic logic [31:0] fp32_value(input int value);
+        case (value)
+            1:  return 32'h3F800000;
+            2:  return 32'h40000000;
+            3:  return 32'h40400000;
+            4:  return 32'h40800000;
+            5:  return 32'h40A00000;
+            6:  return 32'h40C00000;
+            7:  return 32'h40E00000;
+            8:  return 32'h41000000;
+            9:  return 32'h41100000;
+            10: return 32'h41200000;
+            11: return 32'h41300000;
+            12: return 32'h41400000;
+            13: return 32'h41500000;
+            14: return 32'h41600000;
+            default: $fatal(1, "Unsupported FP32 value: %0d", value);
+        endcase
+    endfunction
+
     task display_results;
         $display("RESULTS");
         $display("Thread-ops: %0d | Thread-ops/cycle: %0.2f", thread_ops, real'(thread_ops)/cycle_count);
         $display("\tIssue: %0d", issue);
+        $display("\tEmpty sub warps: %0d", empty_sub_warp);
         $display("\tWriteback stalls: %0d", stall);
         $display("\tFetch Stalls: %0d", fetch_wait);
         $display("\tCommit Stalls: %0d", commit_wait);
@@ -401,9 +425,11 @@ module performance;
                 launch_kernel(4'(i));
                 wait_for_kernel_done(50000);
                 counting = 0;
-
-                for (int sw = 0; sw < 4; ++sw) begin
-                    check_all_lanes(3'd0, sw, 5'd3, 32'd12);
+                
+                for (int w = 0; w < 4; ++w) begin
+                    for (int sw = 0; sw < 4; ++sw) begin
+                        check_all_lanes(3'd0, sw, 5'd3, 32'd12);
+                    end
                 end
 
                 $display("\n\nArithmetic Instructions (%0d warps)", i);
@@ -412,81 +438,561 @@ module performance;
         end
 
         /*
-            LOAD  R4, [R1]       // Cache miss
-            STORE R5, [R1 + 4]   // Store hit
-            LOAD  R6, [R1 + 4]   // Read after store
-            STORE R5, [R2]       // Store miss (write-allocate)
-            LOAD  R7, [R2]       // Read after write-allocate
-            DONE
+            0x00 MOV_WID R1
+            0x04 MOV_TID R2
+            0x08 FMA R3, R4, R5, R6
+            0x0C MOV_BID R10
+            0x10 ADD R7, R8, R9
+
+            // Warp-dependent branch (R11 initialized to 3)
+            0x14 BLT R1, R11, target_offset=0x10, recon_offset=0x18
+
+            // Branch not-taken (warps 3 - 7)
+            0x18 MOV_TID R12
+            0x1C ADD R13, R8, R9
+            0x20 BEQ R0, R0, target_offset=0x0C, recon_offset=0x0C
+
+            // Branch taken (warps 0 - 2)
+            0x24 FMA R14, R4, R5, R6
+            0x28 MOV_WID R15
+
+            // reconvergence point
+            0x2C ADD R16, R8, R10
+
+            // Thread-dependent branch (R17 initialized to 16)
+            0x30 BGE R2, R17, target_offset=0x10, recon_offset=0x1C
+
+            // Branch not-taken (threads 0-15)
+            0x34 MOV_TID R18
+            0x38 SUB R19, R8, R10
+            0x3C BEQ R0, R0, target_offset=0x10, recon_offset=0x10
+
+            // Branch taken (threads 16-31)
+            0x40 FMA R20, R4, R5, R6
+            0x44 ADD R21, R8, R9
+            0x48 MOV_WID R22
+
+            // reconvergence point
+            0x4C FMA R23, R4, R5, R6
+            0x50 ADD R24, R8, R10
+            0x54 DONE
         */
 
         for (int i = 0; i < 9; ++i) begin
             if (i == 1 || i == 2 || i == 4 || i == 8) begin
-                logic [31:0] addr1, addr2, store_val;
-                logic [22:0] beat1, beat2;
+                int expected_ops;
 
                 reset();
                 reset_counts();
                 mig_mem.delete();
-
-                load_instruction('h00, encode_i(LOAD,  1, 4, 0));
-                load_instruction('h04, encode_i(STORE, 1, 5, 4));
-                load_instruction('h08, encode_i(LOAD,  1, 6, 4));
-                load_instruction('h0C, encode_i(STORE, 2, 5, 0));
-                load_instruction('h10, encode_i(LOAD,  2, 7, 0));
-                load_instruction('h14, DONE_INSTR);
-
-                // Each subwarp accesses a different cache line, and each warp its own 4 lines.
-                // All 8 lanes within a subwarp access the same address.
-                // At 8 warps this fills all 64 D$ lines (16 sets x 4 ways) without evicting.
                 initialize_all_lanes();
+
                 for (int w = 0; w < i; ++w) begin
-                    for (int sw = 0; sw < 4; ++sw) begin
-                        set_all_lanes(3'(w), 2'(sw), 1, 32'h1000 + w*512 + sw*128);
-                        set_all_lanes(3'(w), 2'(sw), 2, 32'h2000 + w*512 + sw*128);
-                        set_all_lanes(3'(w), 2'(sw), 5, 32'hABCD_0000 + w*256 + sw);
+                    for (int sw = 0; sw < 4; sw++) begin
+                        set_all_lanes(3'(w), 2'(sw), 5'd4, 32'h40000000);      // R4 = 2.0
+                        set_all_lanes(3'(w), 2'(sw), 5'd5, 32'h40400000);      // R5 = 3.0
+                        set_all_lanes(3'(w), 2'(sw), 5'd6, fp32_value(w + 1)); // R6 = warp_id + 1
+                        set_all_lanes(3'(w), 2'(sw), 5'd11, 32'd3);
+                        set_all_lanes(3'(w), 2'(sw), 5'd17, 32'd16);
+
+                        for (int lane = 0; lane < 8; ++lane) begin
+                            int t;
+                            t = sw * 8 + lane;
+
+                            set_lane_register(3'(lane), 3'(w), 2'(sw), 5'd8, 32'(100 + 10*w + t));
+                            set_lane_register(3'(lane), 3'(w), 2'(sw), 5'd9, 32'(20 + t));
+                        end
                     end
                 end
 
-                thread_ops = 0; counting = 1;
+                load_instruction('h00, encode_special(MOV_WID, 5'd1));
+                load_instruction('h04, encode_special(MOV_TID, 5'd2));
+                load_instruction('h08, encode_fma(5'd4, 5'd5, 5'd6, 5'd3));
+                load_instruction('h0C, encode_special(MOV_BID, 5'd10));
+                load_instruction('h10, encode_r(ADD, 5'd8, 5'd9, 5'd7));
+                load_instruction('h14, encode_branch(BLT, 5'd1, 5'd11, 8'h10, 8'h18));
+                load_instruction('h18, encode_special(MOV_TID, 5'd12));
+                load_instruction('h1C, encode_r(ADD, 5'd8, 5'd9, 5'd13));
+                load_instruction('h20, encode_branch(BEQ, 5'd0, 5'd0, 8'h0C, 8'h0C));
+                load_instruction('h24, encode_fma(5'd4, 5'd5, 5'd6, 5'd14));
+                load_instruction('h28, encode_special(MOV_WID, 5'd15));
+                load_instruction('h2C, encode_r(ADD, 5'd8, 5'd10, 5'd16));
+                load_instruction('h30, encode_branch(BGE, 5'd2, 5'd17, 8'h10, 8'h1C));
+                load_instruction('h34, encode_special(MOV_TID, 5'd18));
+                load_instruction('h38, encode_r(SUB, 5'd8, 5'd10, 5'd19));
+                load_instruction('h3C, encode_branch(BEQ, 5'd0, 5'd0, 8'h10, 8'h10));
+                load_instruction('h40, encode_fma(5'd4, 5'd5, 5'd6, 5'd20));
+                load_instruction('h44, encode_r(ADD, 5'd8, 5'd9, 5'd21));
+                load_instruction('h48, encode_special(MOV_WID, 5'd22));
+                load_instruction('h4C, encode_fma(5'd4, 5'd5, 5'd6, 5'd23));
+                load_instruction('h50, encode_r(ADD, 5'd8, 5'd10, 5'd24));
+                load_instruction('h54, DONE_INSTR);
 
+                // Header first, so "Kernel completed" prints under the right run
+                $display("\n\nMulti-warp Arithmetic (%0d warps)", i);
+
+                thread_ops = 0; counting = 1;
                 launch_kernel(4'(i));
                 wait_for_kernel_done(50000);
                 counting = 0;
 
-                // 5 instructions x 32 threads x i warps (DONE doesn't count)
-                assert (thread_ops == 5 * 32 * i)
-                    else $fatal(1, "Load/store: thread_ops = %0d, expected %0d", thread_ops, 5 * 32 * i);
+                // Per thread: 6 + (2 taken / 3 not taken) + 2 + 3 + 2 = 15 for warps 0-2, 16 for warps 3-7
+                expected_ops = 0;
+                for (int w = 0; w < i; ++w)
+                    expected_ops += 32 * ((w < 3) ? 15 : 16);
+
+                assert (thread_ops == expected_ops)
+                    else $fatal(1, "Multi-warp arithmetic: thread_ops = %0d, expected %0d", thread_ops, expected_ops);
 
                 for (int w = 0; w < i; ++w) begin
-                    for (int sw = 0; sw < 4; ++sw) begin
-                        store_val = 32'hABCD_0000 + w*256 + sw;
+                    for (int sw = 0; sw < 4; sw++) begin
+                        check_all_lanes(3'(w), 2'(sw), 5'd1, w);
+                        check_all_lanes(3'(w), 2'(sw), 5'd3, fp32_value(w + 7));
+                        check_all_lanes(3'(w), 2'(sw), 5'd10, w >> 2);
+                        check_all_lanes(3'(w), 2'(sw), 5'd14, (w < 3 ? fp32_value(w + 7) : 0));
+                        check_all_lanes(3'(w), 2'(sw), 5'd15, (w < 3 ? w : 0));
+                        check_all_lanes(3'(w), 2'(sw), 5'd23, fp32_value(w + 7));
 
-                        // Verify register writebacks
-                        check_all_lanes(3'(w), 2'(sw), 4, (32'h1000 + w*512 + sw*128) ^ K);
-                        check_all_lanes(3'(w), 2'(sw), 6, store_val);
-                        check_all_lanes(3'(w), 2'(sw), 7, store_val);
-
-                        // Verify dirty lines were written back during kernel flush
-                        addr1 = 32'h1004 + w*512 + sw*128;
-                        addr2 = 32'h2000 + w*512 + sw*128;
-
-                        beat1 = addr1[26:4];
-                        beat2 = addr2[26:4];
-
-                        assert (mig_mem.exists(beat1) && mig_mem.exists(beat2))
-                            else $fatal(1, "Load/store: missing dirty-line writeback");
-
-                        assert (mig_mem[beat1][32*addr1[3:2] +: 32] === store_val)
-                            else $fatal(1, "Load/store: STORE hit writeback failed");
-
-                        assert (mig_mem[beat2][32*addr2[3:2] +: 32] === store_val)
-                            else $fatal(1, "Load/store: STORE miss writeback failed");
+                        for (int lane = 0; lane < 8; ++lane) begin
+                            int t;
+                            t = sw * 8 + lane;
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd2, t);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd7, 120 + 10 * w + 2 * t);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd12, (w < 3 ? 0 : t));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd13, (w < 3 ? 0 : 120 + 10 * w + 2 * t));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd16, 100 + 10 * w + t + (w >> 2));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd18, (t >= 16 ? 0 : t));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd19, (t >= 16 ? 0 : 100 + 10 * w + t - (w >> 2)));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd20, (t >= 16 ? fp32_value(w + 7) : 0));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd21, (t >= 16 ? 120 + 10 * w + 2 * t : 0));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd22, (t >= 16 ? w : 0));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd24, 100 + 10 * w + t + (w >> 2));
+                        end
                     end
                 end
 
-                $display("\n\nLoad/Store Instructions (%0d warps)", i);
                 display_results();
+            end
+        end
+
+        /*
+            0x00 MOV_WID R1             R1 = warp ID
+            0x04 MOV_TID R2             R2 = thread ID
+            0x08 ADD R3, R1, R2         R3 = w + t
+            0x0C ADDI R4, R0, 2         R4 = 2
+            0x10 ANDI R5, R2, 3         R5 = t % 4
+            0x14 BLT R5, R4             Branch if t % 4 < 2
+            target_offset=0x14, recon_offset=0x20
+
+            // not taken (t % 4 = 2 or 3)
+            0x18 ADDI R6, R3, 20        R6 = w + t + 20
+            0x1C STORE R6, [R7]
+            0x20 LOAD R8, [R7]
+            0x24 BEQ R0, R0             Skip taken path
+            target_offset=0x10, reconv_offset=0x10
+
+            // taken path (t % 4 = 0 or 1)
+            0x28 ADDI R6, R3, 10        R6 = w + t + 10
+            0x2C STORE R6, [R7]
+            0x30 LOAD R8, [R7]
+
+            // reconvergence point
+            0x34 LOAD R10, [R7]         All threads load after reconvergence
+            0x38 DONE
+        */
+
+        for (int i = 0; i < 9; ++i) begin
+            if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                reset();
+                reset_counts();
+                mig_mem.delete();
+                initialize_all_lanes();
+
+                load_instruction('h00, encode_special(MOV_WID, 5'd1));
+                load_instruction('h04, encode_special(MOV_TID, 5'd2));
+                load_instruction('h08, encode_r(ADD, 5'd1, 5'd2, 5'd3));
+                load_instruction('h0C, encode_i(ADDI, 5'd0, 5'd4, 16'd2));
+                load_instruction('h10, encode_i(ANDI, 5'd2, 5'd5, 16'd3));
+                load_instruction('h14, encode_branch(BLT, 5'd5, 5'd4, 8'h14, 8'h20));
+                load_instruction('h18, encode_i(ADDI, 5'd3, 5'd6, 16'd20));
+                load_instruction('h1C, encode_i(STORE, 5'd7, 5'd6, 16'd0));
+                load_instruction('h20, encode_i(LOAD, 5'd7, 5'd8, 16'd0));
+                load_instruction('h24, encode_branch(BEQ, 5'd0, 5'd0, 8'h10, 8'h10));
+                load_instruction('h28, encode_i(ADDI, 5'd3, 5'd6, 16'd10));
+                load_instruction('h2C, encode_i(STORE, 5'd7, 5'd6, 16'd0));
+                load_instruction('h30, encode_i(LOAD, 5'd7, 5'd8, 16'd0));
+                load_instruction('h34, encode_i(LOAD, 5'd7, 5'd10, 16'd0));
+                load_instruction('h38, DONE_INSTR);
+
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; sw++) begin
+                        for (int lane = 0; lane < 8; ++lane) begin
+                            int t, addr;
+                            t = sw * 8 + lane;
+                            addr = 32'h1000 + 32'h400 * w + 128 * (t % 4) + 4 * (t / 4);
+
+                            set_lane_register(3'(lane), 3'(w), 2'(sw), 5'd7, addr);
+                        end
+                    end
+                end
+
+                $display("\n\nMulti-warp Memory (%0d warps)", i);
+
+                thread_ops = 0; counting = 1;
+                launch_kernel(4'(i));
+                wait_for_kernel_done(50000);
+                counting = 0;
+
+                // Per thread: 6 + (3 taken / 4 not taken) + 1 = 10 or 11, so 336 per warp
+                assert (thread_ops == 336 * i)
+                    else $fatal(1, "Multi-warp memory: thread_ops = %0d, expected %0d", thread_ops, 336 * i);
+
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; sw++) begin
+                        check_all_lanes(3'(w), 2'(sw), 5'd1, w);
+                        check_all_lanes(3'(w), 2'(sw), 5'd4, 32'd2);
+
+                        for (int lane = 0; lane < 8; ++lane) begin
+                            int t;
+                            t = sw * 8 + lane;
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd2, t);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd3, w + t);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd5, t % 4);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd6, (t % 4 < 2 ? w + t + 10 : w + t + 20));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd8, (t % 4 < 2 ? w + t + 10 : w + t + 20));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd10, (t % 4 < 2 ? w + t + 10 : w + t + 20));
+                        end
+                    end
+                end
+
+                // Verify dirty lines were written back during the kernel flush
+                for (int w = 0; w < i; ++w) begin
+                    for (int t = 0; t < 32; ++t) begin
+                        logic [31:0] addr, expected_data;
+                        logic [22:0] beat;
+
+                        addr = 32'h1000 + 'h400 * w + 128 * (t % 4) + 4 * (t / 4);
+                        beat = addr[26:4];
+                        expected_data = w + t + (t % 4 < 2 ? 10 : 20);
+
+                        assert (mig_mem.exists(beat))
+                            else $fatal(1, "Multi-warp memory: Missing dirty-line writeback");
+
+                        assert (mig_mem[beat][32*addr[3:2] +: 32] === expected_data)
+                            else $fatal(1, "Multi-warp memory: STORE writeback failed");
+                    end
+                end
+
+                display_results();
+            end
+        end
+
+        /*
+        Full-system kernel (final_integration_tb TEST 10)
+        Three levels of nested divergence with INT, MUL, FMA, loads and stores,
+        including a store that forces a cache line replacement.
+
+            0x00 MOV_WID R1                 R1 = warp_id
+            0x04 MOV_TID R2                 R2 = thread_id
+            0x08 ADD R3, R1, R2             R3 = w + t
+            0x0C LOAD R4, [R7]              // Input from A
+
+            0x10 ANDI R5, R2, 1             R5 = t % 2
+            0x14 BNE R5, R0                 // Odd threads skip outer IF
+            target_offset = recon_offset = 0x54
+
+            // outer not-taken branch (if t % 2 == 0)
+            0x18 MUL R6, R3, R3             R6 = (w + t)^2
+            0x1C STORE R6, [R7]             A becomes dirty
+
+            0x20 ANDI R5, R2, 3             R5 = t % 4
+            0x24 BNE R5, R0                 skip middle IF when t % 4 != 0
+            target_offset = 0x30, recon_offset = 0x3C
+
+            // middle not-taken branch (t % 4 == 0)
+            0x28 STORE R6, [R8]             B
+            0x2C STORE R6, [R9]             C
+            0x30 STORE R6, [R10]            D
+
+            0x34 ANDI R5, R2, 7             R5 = R2 % 8
+            0x38 BNE R5, R0                 t % 8 != 0
+            target_offset = recon_offset = 0x14
+
+            // inner not-taken branch (if t % 8 == 0)
+            0x3C  FMA R16, R13, R14, R15
+            0x40  STORE R16, [R11]          E, force replacement
+            0x44  LOAD R17, [R7]            Reload A
+            0x48  STORE R17, [R12]          F
+
+            // inner reconvergence point
+            0x4C  ADDI R18, R6, 1           R18 = R6 + 1
+            0x50  BEQ R0, R0                Skip ELSE
+            target_offset = recon_offset = 0x10
+
+            // middle taken branch (t % 4 != 0)
+            0x54  MUL R6, R2, R3            R6 = t(w + t)
+            0x58  STORE R6, [R8]
+            0x5C  LOAD R17, [R8]
+
+            // middle reconvergence point
+            0x60  LOAD R19, [R7]
+            0x64  ADD R20, R19, R3
+
+            // outer reconvergence point
+            0x68  LOAD R21, [R7]
+            0x6C  ADD R22, R21, R3
+            0x70  STORE R22, [R12]
+            0x74  DONE
+        */
+
+        for (int i = 0; i < 9; ++i) begin
+            if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                reset();
+                reset_counts();
+                mig_mem.delete();
+                initialize_all_lanes();
+
+                load_instruction('h00, encode_special(MOV_WID, 5'd1));
+                load_instruction('h04, encode_special(MOV_TID, 5'd2));
+                load_instruction('h08, encode_r(ADD, 5'd1, 5'd2, 5'd3));
+                load_instruction('h0C, encode_i(LOAD, 5'd7, 5'd4, 16'd0));
+                load_instruction('h10, encode_i(ANDI, 5'd2, 5'd5, 16'd1));
+                load_instruction('h14, encode_branch(BNE, 5'd5, 5'd0, 8'h54, 8'h54));
+                load_instruction('h18, encode_r(MUL, 5'd3, 5'd3, 5'd6));
+                load_instruction('h1C, encode_i(STORE, 5'd7, 5'd6, 16'd0));
+                load_instruction('h20, encode_i(ANDI, 5'd2, 5'd5, 16'd3));
+                load_instruction('h24, encode_branch(BNE, 5'd5, 5'd0, 8'h30, 8'h3C));
+                load_instruction('h28, encode_i(STORE, 5'd8, 5'd6, 16'd0));
+                load_instruction('h2C, encode_i(STORE, 5'd9, 5'd6, 16'd0));
+                load_instruction('h30, encode_i(STORE, 5'd10, 5'd6, 16'd0));
+                load_instruction('h34, encode_i(ANDI, 5'd2, 5'd5, 16'd7));
+                load_instruction('h38, encode_branch(BNE, 5'd5, 5'd0, 8'h14, 8'h14));
+                load_instruction('h3C, encode_fma(5'd13, 5'd14, 5'd15, 5'd16));
+                load_instruction('h40, encode_i(STORE, 5'd11, 5'd16, 16'd0));
+                load_instruction('h44, encode_i(LOAD, 5'd7, 5'd17, 16'd0));
+                load_instruction('h48, encode_i(STORE, 5'd12, 5'd17, 16'd0));
+                load_instruction('h4C, encode_i(ADDI, 5'd6, 5'd18, 16'd1));
+                load_instruction('h50, encode_branch(BEQ, 5'd0, 5'd0, 8'h10, 8'h10));
+                load_instruction('h54, encode_r(MUL, 5'd2, 5'd3, 5'd6));
+                load_instruction('h58, encode_i(STORE, 5'd8, 5'd6, 16'd0));
+                load_instruction('h5C, encode_i(LOAD, 5'd8, 5'd17, 16'd0));
+                load_instruction('h60, encode_i(LOAD, 5'd7, 5'd19, 16'd0));
+                load_instruction('h64, encode_r(ADD, 5'd19, 5'd3, 5'd20));
+                load_instruction('h68, encode_i(LOAD, 5'd7, 5'd21, 16'd0));
+                load_instruction('h6C, encode_r(ADD, 5'd21, 5'd3, 5'd22));
+                load_instruction('h70, encode_i(STORE, 5'd12, 5'd22, 16'd0));
+                load_instruction('h74, DONE_INSTR);
+
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; ++sw) begin
+                        for (int lane = 0; lane < 8; ++lane) begin
+                            int t;
+                            logic [31:0] base_addr;
+
+                            t = sw * 8 + lane;
+                            base_addr = 32'h1000 + 128*w + 4*t;
+
+                            // Memory addresses A-F
+                            for (int k = 0; k < 6; ++k)
+                                set_lane_register(3'(lane), 3'(w), 2'(sw), 5'(7+k), base_addr + 32'h800*k);
+
+                            // FP32 operands
+                            set_lane_register(3'(lane), 3'(w), 2'(sw), 5'd13, 32'h40000000);
+                            set_lane_register(3'(lane), 3'(w), 2'(sw), 5'd14, 32'h40400000);
+                            set_lane_register(3'(lane), 3'(w), 2'(sw), 5'd15, 32'h3F800000);
+                        end
+                    end
+                end
+
+                $display("\n\nFull System (%0d warps)", i);
+
+                thread_ops = 0; counting = 1;
+                launch_kernel(4'(i));
+                wait_for_kernel_done(50000);
+                counting = 0;
+
+                // Per warp: 16 odd threads x 9 + 8 (t % 4 == 2) x 18 + 4 (t % 8 == 0) x 26 + 4 (t % 8 == 4) x 22 = 480
+                assert (thread_ops == 480 * i)
+                    else $fatal(1, "Full system: thread_ops = %0d, expected %0d", thread_ops, 480 * i);
+
+                // Final register values. Each thread's path depends on t % 2, t % 4 and t % 8.
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; ++sw) begin
+                        for (int lane = 0; lane < 8; ++lane) begin
+                            int t;
+                            logic [31:0] sum, initial_val, square, product, final_val;
+
+                            t = sw * 8 + lane;
+                            sum = 32'(w + t);
+                            initial_val = (32'h1000 + 32'(128 * w) + 32'(4 * t)) ^ K; // A's initial contents
+                            square = sum * sum;
+                            product = 32'(t) * sum;
+                            final_val = (t % 2 == 0) ? square : initial_val;          // A after the even threads' store
+
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd1, 32'(w));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd2, 32'(t));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd3, sum);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd4, initial_val);
+
+                            // R5 holds the last ANDI each thread ran
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd5,
+                                (t % 2 != 0) ? 32'd1 : (t % 4 == 2) ? 32'd2 : 32'(t % 8));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd6,
+                                (t % 2 != 0) ? 32'd0 : (t % 4 == 2) ? product : square);
+
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd16, (t % 8 == 0) ? 32'h40E00000 : 32'd0); // 2.0 * 3.0 + 1.0
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd17,
+                                (t % 4 == 2) ? product : (t % 8 == 0) ? square : 32'd0);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd18, (t % 4 == 0) ? square + 32'd1 : 32'd0);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd19, (t % 2 == 0) ? square : 32'd0);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd20, (t % 2 == 0) ? square + sum : 32'd0);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd21, final_val);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd22, final_val + sum);
+                        end
+                    end
+                end
+
+                display_results();
+            end
+        end
+
+        /*
+        Kernel A: branch cost.
+        Same 202 instructions as the arithmetic kernel, but every other ADD is replaced by
+        a uniform BEQ to the next PC. All threads take it, so there is no divergence.
+        Compare its cycles against the arithmetic kernel at the same warp count.
+
+        0x000: ADDI r1, r0, 5
+        0x004: ADDI r2, r0, 7
+        0x008: ADD  r3, r1, r2
+        0x00C: BEQ  r0, r0, target_offset=+4, reconverge_offset=+4   // jump to next PC
+        ...    (100 ADD/BEQ pairs)
+        0x328: DONE
+        */
+
+        mig_mem.delete();
+        load_instruction(32'h00, encode_i(ADDI, 5'd0, 5'd1, 16'd5));
+        load_instruction(32'h04, encode_i(ADDI, 5'd0, 5'd2, 16'd7));
+
+        for (int k = 0; k < 100; ++k) begin
+            load_instruction(32'(8 + 8 * k),  encode_r(ADD, 5'd1, 5'd2, 5'd3));
+            load_instruction(32'(12 + 8 * k), encode_branch(BEQ, 5'd0, 5'd0, 8'h04, 8'h04));
+        end
+
+        load_instruction(32'd808, DONE_INSTR);
+
+        for (int i = 0; i < 9; ++i) begin
+            if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                reset();
+                reset_counts();
+                initialize_all_lanes();
+
+                // Header first, so "Kernel completed" prints under the right run
+                $display("\n\nBranch Cost: 100 ADD + 100 uniform BEQ (%0d warps)", i);
+
+                thread_ops = 0; counting = 1;
+                launch_kernel(4'(i));
+                wait_for_kernel_done(50000);
+                counting = 0;
+
+                // 202 instructions x 32 threads x i warps (branches count, DONE doesn't)
+                assert (thread_ops == 202 * 32 * i)
+                    else $fatal(1, "Branch cost: thread_ops = %0d, expected %0d", thread_ops, 202 * 32 * i);
+
+                for (int w = 0; w < i; ++w)
+                    for (int sw = 0; sw < 4; ++sw)
+                        check_all_lanes(3'(w), 2'(sw), 5'd3, 32'd12);
+
+                display_results();
+            end
+        end
+
+        /*
+        Kernel B: divergence cost.
+        A loop of N iterations around an if/else. The testbench sets r1 per sub-warp:
+        r1 = 0 runs the fall-through path (r3), r1 = 1 runs the taken path (r4).
+        Sweep how many sub-warps take the branch: 0 and 4 don't diverge, 1-3 do.
+
+        0x00: ADDI r11, r0, N                                        // loop count
+        loop:
+        0x04: BNE  r1, r0, target_offset=0x18, reconverge_offset=0x28 // taken -> 0x1C, join at 0x2C
+        // fall-through path (5 instructions)
+        0x08: ADDI r3, r3, 1
+        0x0C: ADDI r3, r3, 1
+        0x10: ADDI r3, r3, 1
+        0x14: ADDI r3, r3, 1
+        0x18: BEQ  r0, r0, target_offset=0x14, reconverge_offset=0x14 // jump to join (0x2C)
+        // taken path (4 instructions)
+        0x1C: ADDI r4, r4, 1
+        0x20: ADDI r4, r4, 1
+        0x24: ADDI r4, r4, 1
+        0x28: ADDI r4, r4, 1
+        join:
+        0x2C: ADDI r10, r10, 1
+        0x30: BNE  r10, r11, target_offset=-0x2C, reconverge_offset=+4 // back to loop (0x04)
+        0x34: DONE
+        */
+
+        begin
+            localparam int N = 50;
+            int expected_ops;
+
+            mig_mem.delete();
+            load_instruction(32'h00, encode_i(ADDI, 5'd0, 5'd11, 16'(N)));
+            load_instruction(32'h04, encode_branch(BNE, 5'd1, 5'd0, 8'h18, 8'h28));
+            load_instruction(32'h08, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+            load_instruction(32'h0C, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+            load_instruction(32'h10, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+            load_instruction(32'h14, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+            load_instruction(32'h18, encode_branch(BEQ, 5'd0, 5'd0, 8'h14, 8'h14));
+            load_instruction(32'h1C, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+            load_instruction(32'h20, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+            load_instruction(32'h24, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+            load_instruction(32'h28, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+            load_instruction(32'h2C, encode_i(ADDI, 5'd10, 5'd10, 16'd1));
+            load_instruction(32'h30, encode_branch(BNE, 5'd10, 5'd11, 8'hD4, 8'h04));
+            load_instruction(32'h34, DONE_INSTR);
+
+            // taken = number of sub-warps with r1 = 1 (the highest sub-warps take the branch)
+            for (int taken = 0; taken <= 4; ++taken) begin
+                for (int i = 0; i < 9; ++i) begin
+                    if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                        reset();
+                        reset_counts();
+                        initialize_all_lanes();
+
+                        for (int w = 0; w < i; ++w)
+                            for (int sw = 4 - taken; sw < 4; ++sw)
+                                set_all_lanes(3'(w), 2'(sw), 5'd1, 32'd1);
+
+                        $display("\n\nDivergence Cost: %0d of 4 sub-warps taken, N = %0d (%0d warps)", taken, N, i);
+
+                        thread_ops = 0; counting = 1;
+                        launch_kernel(4'(i));
+                        wait_for_kernel_done(200000);
+                        counting = 0;
+
+                        // Per thread: 1 setup + N x (BNE + path + ADDI + BNE)
+                        // fall-through path = 5 instructions, taken path = 4
+                        expected_ops = 0;
+                        for (int sw = 0; sw < 4; ++sw)
+                            expected_ops += 8 * (1 + N * ((sw >= 4 - taken) ? 7 : 8));
+                        expected_ops *= i;
+
+                        assert (thread_ops == expected_ops)
+                            else $fatal(1, "Divergence cost: thread_ops = %0d, expected %0d", thread_ops, expected_ops);
+
+                        for (int w = 0; w < i; ++w) begin
+                            for (int sw = 0; sw < 4; ++sw) begin
+                                check_all_lanes(3'(w), 2'(sw), 5'd10, 32'(N));
+                                check_all_lanes(3'(w), 2'(sw), 5'd3, (sw >= 4 - taken) ? 32'd0 : 32'(4 * N));
+                                check_all_lanes(3'(w), 2'(sw), 5'd4, (sw >= 4 - taken) ? 32'(4 * N) : 32'd0);
+                            end
+                        end
+
+                        display_results();
+                    end
+                end
             end
         end
 
