@@ -406,7 +406,86 @@ module performance;
                     check_all_lanes(3'd0, sw, 5'd3, 32'd12);
                 end
 
-                $display("\n\nNo. warps: %0d", i);
+                $display("\n\nArithmetic Instructions (%0d warps)", i);
+                display_results();
+            end
+        end
+
+        /*
+            LOAD  R4, [R1]       // Cache miss
+            STORE R5, [R1 + 4]   // Store hit
+            LOAD  R6, [R1 + 4]   // Read after store
+            STORE R5, [R2]       // Store miss (write-allocate)
+            LOAD  R7, [R2]       // Read after write-allocate
+            DONE
+        */
+
+        for (int i = 0; i < 9; ++i) begin
+            if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                logic [31:0] addr1, addr2, store_val;
+                logic [22:0] beat1, beat2;
+
+                reset();
+                reset_counts();
+                mig_mem.delete();
+
+                load_instruction('h00, encode_i(LOAD,  1, 4, 0));
+                load_instruction('h04, encode_i(STORE, 1, 5, 4));
+                load_instruction('h08, encode_i(LOAD,  1, 6, 4));
+                load_instruction('h0C, encode_i(STORE, 2, 5, 0));
+                load_instruction('h10, encode_i(LOAD,  2, 7, 0));
+                load_instruction('h14, DONE_INSTR);
+
+                // Each subwarp accesses a different cache line, and each warp its own 4 lines.
+                // All 8 lanes within a subwarp access the same address.
+                // At 8 warps this fills all 64 D$ lines (16 sets x 4 ways) without evicting.
+                initialize_all_lanes();
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; ++sw) begin
+                        set_all_lanes(3'(w), 2'(sw), 1, 32'h1000 + w*512 + sw*128);
+                        set_all_lanes(3'(w), 2'(sw), 2, 32'h2000 + w*512 + sw*128);
+                        set_all_lanes(3'(w), 2'(sw), 5, 32'hABCD_0000 + w*256 + sw);
+                    end
+                end
+
+                thread_ops = 0; counting = 1;
+
+                launch_kernel(4'(i));
+                wait_for_kernel_done(50000);
+                counting = 0;
+
+                // 5 instructions x 32 threads x i warps (DONE doesn't count)
+                assert (thread_ops == 5 * 32 * i)
+                    else $fatal(1, "Load/store: thread_ops = %0d, expected %0d", thread_ops, 5 * 32 * i);
+
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; ++sw) begin
+                        store_val = 32'hABCD_0000 + w*256 + sw;
+
+                        // Verify register writebacks
+                        check_all_lanes(3'(w), 2'(sw), 4, (32'h1000 + w*512 + sw*128) ^ K);
+                        check_all_lanes(3'(w), 2'(sw), 6, store_val);
+                        check_all_lanes(3'(w), 2'(sw), 7, store_val);
+
+                        // Verify dirty lines were written back during kernel flush
+                        addr1 = 32'h1004 + w*512 + sw*128;
+                        addr2 = 32'h2000 + w*512 + sw*128;
+
+                        beat1 = addr1[26:4];
+                        beat2 = addr2[26:4];
+
+                        assert (mig_mem.exists(beat1) && mig_mem.exists(beat2))
+                            else $fatal(1, "Load/store: missing dirty-line writeback");
+
+                        assert (mig_mem[beat1][32*addr1[3:2] +: 32] === store_val)
+                            else $fatal(1, "Load/store: STORE hit writeback failed");
+
+                        assert (mig_mem[beat2][32*addr2[3:2] +: 32] === store_val)
+                            else $fatal(1, "Load/store: STORE miss writeback failed");
+                    end
+                end
+
+                $display("\n\nLoad/Store Instructions (%0d warps)", i);
                 display_results();
             end
         end
