@@ -6,6 +6,7 @@ module decode_stage (
 
     input logic buffer_full,
     input logic sub_warp_valid,
+    input logic sub_warp_last,
     input logic [1:0] sub_warp_cycle,
     input logic [2:0] curr_warp,
     input logic [31:0] active_mask,
@@ -14,6 +15,7 @@ module decode_stage (
     input logic [31:0] instr_pc,
 
     output logic sub_warp_valid_q,
+    output logic sub_warp_last_q,
     output logic [1:0] sub_warp_cycle_q,
     
     output logic [5:0] opcode_q,
@@ -43,15 +45,17 @@ module decode_stage (
     // stay tagged with the same sub-group source register addresses in instruction_latch
 
     logic [1:0] sub_warp_cycle_prev;
-    logic       sub_warp_valid_prev;
+    logic sub_warp_valid_prev, sub_warp_last_prev;
 
     always_ff @(posedge clk) begin
         if (reset) begin
             sub_warp_cycle_prev <= 2'b0;
             sub_warp_valid_prev <= 1'b0;
+            sub_warp_last_prev <= 1'b0;
         end else if (!buffer_full) begin
             sub_warp_cycle_prev <= sub_warp_cycle;
             sub_warp_valid_prev <= sub_warp_valid;
+            sub_warp_last_prev <= sub_warp_last;
         end
     end
 
@@ -96,6 +100,7 @@ module decode_stage (
     always_ff @(posedge clk) begin
         if (reset) begin
             sub_warp_valid_q <= 1'b0;
+            sub_warp_last_q <= 1'b0;
             sub_warp_cycle_q <= 2'b0;
             opcode_q <= 6'b0;
             alu_valid_q <= 1'b0;
@@ -106,6 +111,7 @@ module decode_stage (
             instr_pc_q <= 32'b0;
         end else if (!buffer_full) begin
             sub_warp_valid_q <= sub_warp_valid_prev;
+            sub_warp_last_q <= sub_warp_last_prev;
             sub_warp_cycle_q <= sub_warp_cycle_prev;
             opcode_q <= opcode;
             alu_valid_q <= curr_active_mask & {8{alu_valid & sub_warp_valid_prev}};

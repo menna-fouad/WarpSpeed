@@ -6,6 +6,7 @@ module int_alu (
     input logic valid_in,
     input logic buffer_full,
     input logic sub_warp_valid_in,
+    input logic sub_warp_last_in,
     input logic [1:0] sub_warp_cycle_in,
     input logic [9:0] reg_bank_addr_in,
 
@@ -27,6 +28,7 @@ module int_alu (
     // Output warp_id, thread_slot, and dest_register for writeback_arbiter
     // This is simply the input passed to the output
     output logic sub_warp_valid_out,
+    output logic sub_warp_last_out,
     output logic [1:0] sub_warp_cycle_out,
     output logic [9:0] reg_bank_addr_out,
 
@@ -157,6 +159,7 @@ module int_alu (
         if (reset) begin
             sub_warp_cycle_out <= 2'b0;
             sub_warp_valid_out <= 1'b0;
+            sub_warp_last_out <= 1'b0;
             is_branch <= 1'b0;
             is_load <= 1'b0;
             is_store <= 1'b0;
@@ -168,6 +171,7 @@ module int_alu (
         end else if (!buffer_full) begin
             sub_warp_cycle_out <= sub_warp_cycle_in;
             sub_warp_valid_out <= sub_warp_valid_in;
+            sub_warp_last_out <= sub_warp_last_in;
             is_branch <= (opcode[5:3] == BRANCH);
             is_load <= (opcode == {I_TYPE, LOAD});
             is_store <= (opcode == {I_TYPE, STORE});

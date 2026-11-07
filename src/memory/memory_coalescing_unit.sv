@@ -10,6 +10,7 @@ module memory_coalescing_unit (
     input logic is_load,
     input logic is_store,
     input logic sub_warp_valid,
+    input logic sub_warp_last,
     input logic [1:0] sub_warp_cycle,
     input logic [9:0] reg_bank_addr,
 
@@ -74,6 +75,7 @@ module memory_coalescing_unit (
 
     always_ff @(posedge clk) begin
         if (sub_warp_valid && (is_load || is_store)) begin
+            if (sub_warp_cycle == 2'd0) slot_mask[incoming_warp] <= 32'b0;
             slot_addr[incoming_warp][sub_warp_cycle*8 +: 8] <= addr;
             slot_store_data[incoming_warp][sub_warp_cycle*8 +: 8] <= src2;
             slot_mask[incoming_warp][sub_warp_cycle*8 +: 8] <= valid;
@@ -89,7 +91,7 @@ module memory_coalescing_unit (
 
     assign issue_done = req_valid && req_ready && txn_last;
 
-    assign fifo_push = sub_warp_valid && (is_load || is_store) && (&sub_warp_cycle);
+    assign fifo_push = sub_warp_valid && sub_warp_last && (is_load || is_store);
     assign fifo_pop = |ready_count && issue_done;
 
     assign direct_handoff = (ready_count == 0) && fifo_push && (issue_done || (issue_state == IDLE));
@@ -132,7 +134,7 @@ module memory_coalescing_unit (
                 slot_state[w] <= EMPTY;
         end else begin
             if (sub_warp_valid && (is_load || is_store))
-                slot_state[incoming_warp] <= (&sub_warp_cycle) ? READY : ACCUM;
+                slot_state[incoming_warp] <= (sub_warp_last) ? READY : ACCUM;
 
             if (fifo_pop) begin
                 issuing_warp <= ready_fifo[0];

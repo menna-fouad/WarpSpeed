@@ -33,7 +33,12 @@ module sm_top (
 );
     logic fetch_valid, sub_warp_valid, have_ready;
     (* max_fanout = 64 *) logic wb_buffer_full;
+
+    logic [7:0][31:0] recon_top_mask_arr;
+    logic [2:0] ws_next_warp;
+    
     logic [1:0] sub_warp_cycle;
+    logic sub_warp_last;
 
     sub_warp_counter u_sub_warp_counter (
         .clk(sm_clk),
@@ -41,8 +46,10 @@ module sm_top (
         .fetch_valid(fetch_valid), // from fetch_stage
         .buffer_full(wb_buffer_full), // from writeback_arbiter
         .have_ready(have_ready), // from warp_scheduler
+        .next_mask(recon_top_mask_arr[ws_next_warp]), // from recon_stack
         .sub_warp_cycle(sub_warp_cycle),
-        .sub_warp_valid(sub_warp_valid)
+        .sub_warp_valid(sub_warp_valid),
+        .sub_warp_last(sub_warp_last)
     );
 
     logic consume, fetch_allowed;
@@ -50,7 +57,7 @@ module sm_top (
     logic [7:0] commit_done;
     logic [7:0] recon_push2_done_arr;
 
-    logic [2:0] ws_curr_warp, ws_next_warp;
+    logic [2:0] ws_curr_warp;
     logic ws_issue_valid;
     logic warps_done;
 
@@ -81,7 +88,6 @@ module sm_top (
 
     // recon_stack x8
     // recon_stack outputs
-    logic [7:0][31:0] recon_top_mask_arr;
     logic [7:0][31:0] recon_top_pc_arr;
     logic [7:0][31:0] recon_top_recon_pc_arr;
 
@@ -193,7 +199,7 @@ module sm_top (
         .src3_addr(il_src3_addr)
     );
 
-    logic dec_sub_warp_valid;
+    logic dec_sub_warp_valid, dec_sub_warp_last;
     logic [1:0] dec_sub_warp_cycle;
     logic [5:0] dec_opcode;
     logic [7:0] dec_alu_valid, dec_fma_valid, dec_special_reg_valid;
@@ -206,12 +212,14 @@ module sm_top (
         .reset(sm_reset),
         .buffer_full(wb_buffer_full),
         .sub_warp_valid(sub_warp_valid),
+        .sub_warp_last(sub_warp_last),
         .sub_warp_cycle(sub_warp_cycle),
         .curr_warp(ws_curr_warp),
         .active_mask(il_active_mask),
         .instr(il_instr),
         .instr_pc(il_instr_pc),
         .sub_warp_valid_q(dec_sub_warp_valid),
+        .sub_warp_last_q(dec_sub_warp_last),
         .sub_warp_cycle_q(dec_sub_warp_cycle),
         .opcode_q(dec_opcode),
         .done_detect(dec_done_detect),
@@ -258,7 +266,7 @@ module sm_top (
     logic [7:0][31:0] mul_result_arr;
     logic [7:0][9:0] mul_addr_arr;
 
-    logic [7:0] alu_is_branch_arr, alu_is_load_arr, alu_is_store_arr, alu_sub_warp_valid_arr;
+    logic [7:0] alu_is_branch_arr, alu_is_load_arr, alu_is_store_arr, alu_sub_warp_valid_arr, alu_sub_warp_last_arr;
     logic [7:0][1:0] alu_sub_warp_cycle_arr;
     logic [7:0][31:0] alu_branch_pc_arr;
     logic [7:0][7:0] alu_recon_offset_arr;
@@ -274,6 +282,7 @@ module sm_top (
                 .valid_in(dec_alu_valid[gi]),
                 .buffer_full(wb_buffer_full),
                 .sub_warp_valid_in(dec_sub_warp_valid),
+                .sub_warp_last_in(dec_sub_warp_last),
                 .sub_warp_cycle_in(dec_sub_warp_cycle),
                 .reg_bank_addr_in(dec_dest_addr),
                 .opcode(dec_opcode),
@@ -290,6 +299,7 @@ module sm_top (
                 
                 // outputs for writeback_arbiter
                 .sub_warp_valid_out(alu_sub_warp_valid_arr[gi]),
+                .sub_warp_last_out(alu_sub_warp_last_arr[gi]),
                 .sub_warp_cycle_out(alu_sub_warp_cycle_arr[gi]),
                 .reg_bank_addr_out(alu_reg_bank_addr_out[gi]),
 
@@ -308,6 +318,7 @@ module sm_top (
     wire alu_is_load = alu_is_load_arr[0];
     wire alu_is_store = alu_is_store_arr[0];
     wire alu_sub_warp_valid = alu_sub_warp_valid_arr[0];
+    wire alu_sub_warp_last = alu_sub_warp_last_arr[0];
     wire [1:0] alu_sub_warp_cycle = alu_sub_warp_cycle_arr[0];
     wire [9:0] alu_reg_bank_addr = alu_reg_bank_addr_out[0];
     wire [31:0] alu_branch_pc = alu_branch_pc_arr[0];
@@ -319,6 +330,7 @@ module sm_top (
         .buffer_full(wb_buffer_full),
         .sub_warp_cycle(alu_sub_warp_cycle),
         .sub_warp_valid(alu_sub_warp_valid),
+        .sub_warp_last(alu_sub_warp_last),
         .is_branch(alu_is_branch),
         .is_valid(alu_valid_out),
         .branch_taken_bits(alu_branch_taken),
@@ -467,6 +479,7 @@ module sm_top (
         .is_load(alu_is_load),
         .is_store(alu_is_store),
         .sub_warp_valid(alu_sub_warp_valid),
+        .sub_warp_last(alu_sub_warp_last),
         .sub_warp_cycle(alu_sub_warp_cycle),
         .reg_bank_addr(alu_reg_bank_addr),
         // interface to data cache

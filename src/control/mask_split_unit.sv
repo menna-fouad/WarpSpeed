@@ -7,6 +7,7 @@ module mask_split_unit #(
     input logic reset,
     input logic [1:0] sub_warp_cycle,
     input logic sub_warp_valid,
+    input logic sub_warp_last,
     input logic buffer_full, // causes ALU to hold results for multiple cycles
 
     // Information about the branch
@@ -34,7 +35,7 @@ module mask_split_unit #(
     output logic [NUM_WARPS-1:0] recon_push2_valid
 );
     logic accum_done;
-    assign accum_done = (&sub_warp_cycle && sub_warp_valid);
+    assign accum_done = (sub_warp_last && sub_warp_valid);
 
     // Next mask values, so the skip flags see the same masks that get registered
     logic [31:0] mask_taken_next, mask_not_taken_next;
@@ -44,6 +45,11 @@ module mask_split_unit #(
         mask_not_taken_next = push2_mask_not_taken;
 
         if (is_branch && !buffer_full && sub_warp_valid) begin
+            if (sub_warp_cycle == 2'd0) begin
+                mask_taken_next = 32'b0;
+                mask_not_taken_next = 32'b0;
+            end
+            
             mask_taken_next[sub_warp_cycle*8 +: 8] = is_valid & branch_taken_bits;
             mask_not_taken_next[sub_warp_cycle*8 +: 8] = is_valid & ~branch_taken_bits;
         end
