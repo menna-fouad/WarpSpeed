@@ -29,6 +29,7 @@ module performance;
     int thread_ops = 0;
     int cycle_count = 0;
 
+    int instr_count = 0;
     int stall = 0;
     int issue = 0;
     int flush = 0;
@@ -42,6 +43,7 @@ module performance;
     always @(posedge sm_clk) begin
         if (counting) begin
             cycle_count <= cycle_count + 1;
+            instr_count <= instr_count + u_sm_top.consume;
 
             if (u_sm_top.wb_buffer_full) stall <= stall + 1;
             else if ((|u_sm_top.dec_alu_valid) | (|u_sm_top.dec_fma_valid) | (|u_sm_top.dec_special_reg_valid))
@@ -62,6 +64,7 @@ module performance;
     task reset_counts;
         thread_ops = 0;
         cycle_count = 0;
+        instr_count = 0;
 
         stall = 0;
         issue = 0;
@@ -384,9 +387,10 @@ module performance;
         endcase
     endfunction
 
-    task display_results;
+    task display_results(input logic [3:0] warps);
         $display("RESULTS");
         $display("Thread-ops: %0d | Thread-ops/cycle: %0.2f", thread_ops, real'(thread_ops)/cycle_count);
+        $display("SIMD Efficiency: %0.2f%%", 100.0 * real'(thread_ops) / ((instr_count - warps) * 32));
         $display("\tIssue: %0d", issue);
         $display("\tEmpty sub warps: %0d", empty_sub_warp);
         $display("\tWriteback stalls: %0d", stall);
@@ -433,7 +437,7 @@ module performance;
                 end
 
                 $display("\n\nArithmetic Instructions (%0d warps)", i);
-                display_results();
+                display_results(i);
             end
         end
 
@@ -571,7 +575,7 @@ module performance;
                     end
                 end
 
-                display_results();
+                display_results(i);
             end
         end
 
@@ -683,7 +687,7 @@ module performance;
                     end
                 end
 
-                display_results();
+                display_results(i);
             end
         end
 
@@ -852,7 +856,7 @@ module performance;
                     end
                 end
 
-                display_results();
+                display_results(i);
             end
         end
 
@@ -903,7 +907,7 @@ module performance;
                     for (int sw = 0; sw < 4; ++sw)
                         check_all_lanes(3'(w), 2'(sw), 5'd3, 32'd12);
 
-                display_results();
+                display_results(i);
             end
         end
 
@@ -990,7 +994,7 @@ module performance;
                             end
                         end
 
-                        display_results();
+                        display_results(i);
                     end
                 end
             end
