@@ -61,6 +61,19 @@ module performance;
                         + $countones(u_sm_top.dec_special_reg_valid);
     end
 
+    int mem_txns = 0;
+    int mem_instrs = 0;
+
+    always @(posedge sm_clk) begin
+        if (counting) begin
+            if (u_sm_top.dcache_req_valid && u_sm_top.dcache_req_ready)
+                mem_txns <= mem_txns + 1;
+            
+            if (u_sm_top.coalescing.issue_done)
+                mem_instrs <= mem_instrs + 1;
+        end
+    end
+
     task reset_counts;
         thread_ops = 0;
         cycle_count = 0;
@@ -73,6 +86,9 @@ module performance;
         fetch_wait = 0;
         empty_sub_warp = 0;
         other = 0;
+
+        mem_txns = 0;
+        mem_instrs = 0;
     endtask
 
     // fake MIG
@@ -387,7 +403,7 @@ module performance;
         endcase
     endfunction
 
-    task display_results(input logic [3:0] warps);
+    task automatic display_results(input logic [3:0] warps);
         $display("RESULTS");
         $display("Thread-ops: %0d | Thread-ops/cycle: %0.2f", thread_ops, real'(thread_ops)/cycle_count);
         $display("SIMD Efficiency: %0.2f%%", 100.0 * real'(thread_ops) / ((instr_count - warps) * 32));
@@ -688,6 +704,7 @@ module performance;
                 end
 
                 display_results(i);
+                $display("Coalescing ratio: %0.2f", real'(mem_txns)/mem_instrs);
             end
         end
 
@@ -857,6 +874,7 @@ module performance;
                 end
 
                 display_results(i);
+                $display("Coalescing ratio: %0.2f", real'(mem_txns)/mem_instrs);
             end
         end
 
