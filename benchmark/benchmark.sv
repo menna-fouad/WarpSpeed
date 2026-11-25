@@ -74,6 +74,45 @@ module performance;
         end
     end
 
+    int dc_access = 0;
+    int dc_miss = 0;
+    int dc_wb = 0;
+
+    int ic_access = 0;
+    int ic_miss = 0;
+
+    always @(posedge sm_clk) begin
+        if (counting) begin
+            dc_access <= dc_access + (u_sm_top.dcache_req_valid && u_sm_top.dcache_req_ready);
+            dc_miss <= dc_miss + (u_sm_top.dcache_mem_req_valid && u_sm_top.dcache_mem_req_ready
+                                && !u_sm_top.dcache_mem_req_write);
+            // evictions only: dirty victim written back on a miss, flush excluded
+            dc_wb <= dc_wb + (u_sm_top.dcache_mem_req_valid && u_sm_top.dcache_mem_req_ready
+                            && u_sm_top.dcache_mem_req_write && !u_sm_top.dcache.flushing);
+
+            ic_access <= ic_access + (u_sm_top.icache_req_ready && u_sm_top.icache_req_valid);
+            ic_miss <= ic_miss + (u_sm_top.icache_mem_req_valid && u_sm_top.icache_mem_req_ready);
+        end
+    end
+
+    // Bandwidth: one beat = 16 bytes (MEM_W = 128). Counted on the cache side of the arbiter.
+    int dc_rd_beats = 0; // DDR -> D$ fill beats
+    int dc_wr_beats = 0; // D$ -> DDR writeback beats, including the end-of-kernel flush
+    int ic_rd_beats = 0; // DDR -> I$ fill beats
+
+    // Cycles the coalescer has a request but the blocking D$ can't take it
+    int dc_blocked = 0;
+
+    always @(posedge sm_clk) begin
+        if (counting) begin
+            dc_rd_beats <= dc_rd_beats + u_sm_top.dcache_mem_rvalid;
+            dc_wr_beats <= dc_wr_beats + (u_sm_top.dcache_mem_wvalid && u_sm_top.dcache_mem_wready);
+            ic_rd_beats <= ic_rd_beats + u_sm_top.icache_mem_rvalid;
+
+            dc_blocked <= dc_blocked + (u_sm_top.dcache_req_valid && !u_sm_top.dcache_req_ready);
+        end
+    end
+
     task reset_counts;
         thread_ops = 0;
         cycle_count = 0;
@@ -89,6 +128,18 @@ module performance;
 
         mem_txns = 0;
         mem_instrs = 0;
+
+        dc_access = 0;
+        dc_miss = 0;
+        dc_wb = 0;
+
+        ic_access = 0;
+        ic_miss = 0;
+
+        dc_rd_beats = 0;
+        dc_wr_beats = 0;
+        ic_rd_beats = 0;
+        dc_blocked = 0;
     endtask
 
     // fake MIG
@@ -415,6 +466,51 @@ module performance;
         $display("\tFlush: %0d", flush);
         $display("\tOther: %0d\n", other);
     endtask
+
+    task automatic display_memory_results();
+        if (dc_access > 0) begin
+            $display("Coalescing ratio: %0.2f", real'(mem_txns)/mem_instrs);
+            $display("D$ hit rate: %0.2f", real'(dc_access - dc_miss)/dc_access);
+            $display("D$ MPKI: %0.2f", real'(dc_miss * 1000)/instr_count);
+            $display("D$ writeback (evictions): %0d", dc_wb);
+            $display("D$ writeback (flush): %0d", dc_wr_beats / 8 - dc_wb);
+            $display("D$ blocked cycles: %0d (%0.1f%% of cycles)\n",
+                     dc_blocked, 100.0 * real'(dc_blocked) / cycle_count);
+        end
+
+        if (ic_access > 0) begin
+            $display("I$ hit rate: %0.2f", real'(ic_access - ic_miss)/ic_access);
+            $display("I$ MPKI: %0.2f\n", real'(ic_miss * 1000)/instr_count);
+        end
+
+        int total_beats;
+        real bytes, bytes_per_cycle, mb_per_s;
+
+        total_beats = dc_rd_beats + dc_wr_beats + ic_rd_beats;
+        bytes = 16.0 * total_beats;
+        bytes_per_cycle = bytes / cycle_count;
+        mb_per_s = bytes_per_cycle * 100.0; // 100 MHz sm_clk: bytes/cycle * 1e8 / 1e6
+
+        $display("Bandwidth:");
+        $display("\tD$ read:  %0d B (%0.1f MB/s)", 16 * dc_rd_beats, 1600.0 * dc_rd_beats / cycle_count);
+        $display("\tD$ write: %0d B (%0.1f MB/s)", 16 * dc_wr_beats, 1600.0 * dc_wr_beats / cycle_count);
+        $display("\tI$ read:  %0d B (%0.1f MB/s)", 16 * ic_rd_beats, 1600.0 * ic_rd_beats / cycle_count);
+        $display("\tTotal:    %0.0f B | %0.2f B/cycle | %0.1f MB/s @ 100 MHz | %0.1f%% of 1.3 GB/s DDR2 peak",
+                 bytes, bytes_per_cycle, mb_per_s, 100.0 * mb_per_s / 1300.0);
+        $display("\tBus busy: %0.1f%% of cycles", 100.0 * real'(total_beats) / cycle_count);
+        if (instr_count > 0)
+            $display("\tBytes/instruction: %0.1f", bytes / instr_count);
+
+        // Each counter pair sees the same events from two places, so they must agree
+        assert (dc_access == mem_txns)
+            else $error("dc_access (%0d) != mem_txns (%0d)", dc_access, mem_txns);
+        assert (dc_rd_beats == 8 * dc_miss)
+            else $error("dc_rd_beats (%0d) != 8 * dc_miss (%0d)", dc_rd_beats, 8 * dc_miss);
+        assert (ic_rd_beats == 8 * ic_miss)
+            else $error("ic_rd_beats (%0d) != 8 * ic_miss (%0d)", ic_rd_beats, 8 * ic_miss);
+        assert (dc_wr_beats % 8 == 0 && dc_wr_beats >= 8 * dc_wb)
+            else $error("dc_wr_beats (%0d) is not whole lines covering dc_wb (%0d)", dc_wr_beats, dc_wb);
+    endtask
     
     initial begin
         sm_clk = 1'b0; mem_ui_clk = 1'b0;
@@ -704,7 +800,7 @@ module performance;
                 end
 
                 display_results(i);
-                $display("Coalescing ratio: %0.2f", real'(mem_txns)/mem_instrs);
+                display_memory_results();
             end
         end
 
@@ -874,7 +970,7 @@ module performance;
                 end
 
                 display_results(i);
-                $display("Coalescing ratio: %0.2f", real'(mem_txns)/mem_instrs);
+                display_memory_results();
             end
         end
 
