@@ -401,6 +401,9 @@ module benchmark;
     // Special reg instructions
     localparam logic [5:0] MOV_TID = 6'b100001, MOV_WID = 6'b100010, MOV_BID = 6'b100100;
 
+    // Shift instructions
+    localparam logic [5:0] SLLI = 6'b101000, SRAI = 6'b101001;
+
     // DONE Instruction
     localparam logic [31:0] DONE_INSTR = 32'hFC00_0000;
 
@@ -446,6 +449,16 @@ module benchmark;
         return {opcode, dst, 21'b0};
     endfunction
 
+    // shift: opcode | src1 | dst | unused | shift amount
+    function automatic logic [31:0] encode_shift(
+        input logic [5:0] opcode,
+        input logic [4:0] src1,
+        input logic [4:0] dst,
+        input logic [4:0] shift_amount
+    );
+        return {opcode, src1, dst, 11'b0, shift_amount};
+    endfunction
+
     task automatic load_instruction(
         input logic [31:0] byte_addr,
         input logic [31:0] instr
@@ -460,6 +473,16 @@ module benchmark;
 
         mig_mem[beat] = data;
     endtask
+
+    // Reads one word of DDR as the fake MIG holds it (written beats, else the init pattern)
+    function automatic logic [31:0] read_word(input logic [31:0] byte_addr);
+        logic [22:0] beat;
+        logic [127:0] data;
+
+        beat = byte_addr[26:4];
+        data = mig_mem.exists(beat) ? mig_mem[beat] : init_beat(beat);
+        return data[32 * byte_addr[3:2] +: 32];
+    endfunction
 
     generate
         for (genvar lane = 0; lane < 8; lane++) begin : init_rf
@@ -1259,65 +1282,209 @@ module benchmark;
         */
 
         begin
-            localparam int N = 50;
-            int expected_ops;
+        localparam int N = 50;
+        int expected_ops;
 
-            mig_mem.delete();
-            load_instruction(32'h00, encode_i(ADDI, 5'd0, 5'd11, 16'(N)));
-            load_instruction(32'h04, encode_branch(BNE, 5'd1, 5'd0, 8'h18, 8'h28));
-            load_instruction(32'h08, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
-            load_instruction(32'h0C, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
-            load_instruction(32'h10, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
-            load_instruction(32'h14, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
-            load_instruction(32'h18, encode_branch(BEQ, 5'd0, 5'd0, 8'h14, 8'h14));
-            load_instruction(32'h1C, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
-            load_instruction(32'h20, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
-            load_instruction(32'h24, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
-            load_instruction(32'h28, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
-            load_instruction(32'h2C, encode_i(ADDI, 5'd10, 5'd10, 16'd1));
-            load_instruction(32'h30, encode_branch(BNE, 5'd10, 5'd11, 8'hD4, 8'h04));
-            load_instruction(32'h34, DONE_INSTR);
+        mig_mem.delete();
+        load_instruction(32'h00, encode_i(ADDI, 5'd0, 5'd11, 16'(N)));
+        load_instruction(32'h04, encode_branch(BNE, 5'd1, 5'd0, 8'h18, 8'h28));
+        load_instruction(32'h08, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+        load_instruction(32'h0C, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+        load_instruction(32'h10, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+        load_instruction(32'h14, encode_i(ADDI, 5'd3, 5'd3, 16'd1));
+        load_instruction(32'h18, encode_branch(BEQ, 5'd0, 5'd0, 8'h14, 8'h14));
+        load_instruction(32'h1C, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+        load_instruction(32'h20, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+        load_instruction(32'h24, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+        load_instruction(32'h28, encode_i(ADDI, 5'd4, 5'd4, 16'd1));
+        load_instruction(32'h2C, encode_i(ADDI, 5'd10, 5'd10, 16'd1));
+        load_instruction(32'h30, encode_branch(BNE, 5'd10, 5'd11, 8'hD4, 8'h04));
+        load_instruction(32'h34, DONE_INSTR);
 
-            // taken = number of sub-warps with r1 = 1 (the highest sub-warps take the branch)
-            for (int taken = 0; taken <= 4; ++taken) begin
-                for (int i = 0; i < 9; ++i) begin
-                    if (i == 1 || i == 2 || i == 4 || i == 8) begin
-                        reset();
-                        reset_counts();
-                        initialize_all_lanes();
+        // taken = number of sub-warps with r1 = 1 (the highest sub-warps take the branch)
+        for (int taken = 0; taken <= 4; ++taken) begin
+            for (int i = 0; i < 9; ++i) begin
+                if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                    reset();
+                    reset_counts();
+                    initialize_all_lanes();
 
-                        for (int w = 0; w < i; ++w)
-                            for (int sw = 4 - taken; sw < 4; ++sw)
-                                set_all_lanes(3'(w), 2'(sw), 5'd1, 32'd1);
+                    for (int w = 0; w < i; ++w)
+                        for (int sw = 4 - taken; sw < 4; ++sw)
+                            set_all_lanes(3'(w), 2'(sw), 5'd1, 32'd1);
 
-                        $display("\n\nDivergence Cost: %0d of 4 sub-warps taken, N = %0d (%0d warps)", taken, N, i);
+                    $display("\n\nDivergence Cost: %0d of 4 sub-warps taken, N = %0d (%0d warps)", taken, N, i);
 
-                        thread_ops = 0; counting = 1;
-                        launch_kernel(4'(i));
-                        wait_for_kernel_done(200000);
-                        counting = 0;
+                    thread_ops = 0; counting = 1;
+                    launch_kernel(4'(i));
+                    wait_for_kernel_done(200000);
+                    counting = 0;
 
-                        // Per thread: 1 setup + N x (BNE + path + ADDI + BNE)
-                        // fall-through path = 5 instructions, taken path = 4
-                        expected_ops = 0;
-                        for (int sw = 0; sw < 4; ++sw)
-                            expected_ops += 8 * (1 + N * ((sw >= 4 - taken) ? 7 : 8));
-                        expected_ops *= i;
+                    // Per thread: 1 setup + N x (BNE + path + ADDI + BNE)
+                    // fall-through path = 5 instructions, taken path = 4
+                    expected_ops = 0;
+                    for (int sw = 0; sw < 4; ++sw)
+                        expected_ops += 8 * (1 + N * ((sw >= 4 - taken) ? 7 : 8));
+                    expected_ops *= i;
 
-                        assert (thread_ops == expected_ops)
-                            else $fatal(1, "Divergence cost: thread_ops = %0d, expected %0d", thread_ops, expected_ops);
+                    assert (thread_ops == expected_ops)
+                        else $fatal(1, "Divergence cost: thread_ops = %0d, expected %0d", thread_ops, expected_ops);
 
-                        for (int w = 0; w < i; ++w) begin
-                            for (int sw = 0; sw < 4; ++sw) begin
-                                check_all_lanes(3'(w), 2'(sw), 5'd10, 32'(N));
-                                check_all_lanes(3'(w), 2'(sw), 5'd3, (sw >= 4 - taken) ? 32'd0 : 32'(4 * N));
-                                check_all_lanes(3'(w), 2'(sw), 5'd4, (sw >= 4 - taken) ? 32'(4 * N) : 32'd0);
-                            end
+                    for (int w = 0; w < i; ++w) begin
+                        for (int sw = 0; sw < 4; ++sw) begin
+                            check_all_lanes(3'(w), 2'(sw), 5'd10, 32'(N));
+                            check_all_lanes(3'(w), 2'(sw), 5'd3, (sw >= 4 - taken) ? 32'd0 : 32'(4 * N));
+                            check_all_lanes(3'(w), 2'(sw), 5'd4, (sw >= 4 - taken) ? 32'(4 * N) : 32'd0);
                         end
+                    end
 
-                        display_results(i);
+                    display_results(i);
+                end
+            end
+        end
+        end
+
+        $display("SAXPY Kernel");
+
+        /*
+            // element = step * 256 + warp * 32 + thread
+            // address = base + 4 * element
+            // address = base + step * 1024 + warp * 128 + thread * 4
+
+            // base for x in R1
+            // base for y in R2
+
+            0x00 MOV_WID R5                 // R5 = warp (0–7)
+            0x04 SLLI R5, R5, 7             // R5 = warp × 128
+            0x08 MOV_TID R6                 // R6 = thread (0–31)
+            0x0C SLLI R6, R6, 2             // R6 = thread × 4
+            0x10 ADD R5, R5, R6             // R5 = warp×128 + thread×4  (this thread's offset at step 0)
+            0x14 ADD R1, R1, R5             // R1 = address of x at step 0
+            0x18 ADD R2, R2, R5             // R2 = address of y at step 0
+            0x1C LUI R3, 0x4000             // R3 = 0x40000000 = 2.0f
+            0x20 ADDI R4, R0, 16            // R4 = 16 passes left
+
+            0x24 LOAD R5, 0(R1)             // R5 = x[i]
+            0x28 LOAD R6, 0(R2)             // R6 = y[i]
+            0x2C FMA R6, R3, R5, R6         // R6 = a × x[i] + y[i]
+            0x30 STORE R6, 0(R2)            // y[i] = R6
+
+            0x34 ADDI R1, R1, 1024
+            0x38 ADDI R2, R2, 1024
+            0x3C SUBI R4, R4, 1
+
+            0x40 BNE R4, R0, LOOP           // jump to next iteration when there are still steps left
+                                            // target_offset = -0x1C (0xE4), recon_offset = 0x04
+
+            0x44 DONE
+        */
+
+        localparam int N = 4096;
+        localparam int PASSES = 16;
+        localparam logic [31:0] X_BASE = 32'h0000_1000; // x: 0x1000 - 0x4FFF
+        localparam logic [31:0] Y_BASE = 32'h0000_5000; // y: 0x5000 - 0x8FFF
+        int errors;
+
+        for (int i = 0; i < 9; ++i) begin
+            if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                reset();
+                reset_counts();
+                mig_mem.delete();
+                initialize_all_lanes();
+
+                load_instruction('h00, encode_special(MOV_WID, 5'd5));
+                load_instruction('h04, encode_shift(SLLI, 5'd5, 5'd5, 5'd7));
+                load_instruction('h08, encode_special(MOV_TID, 5'd6));
+                load_instruction('h0C, encode_shift(SLLI, 5'd6, 5'd6, 5'd2));
+                load_instruction('h10, encode_r(ADD, 5'd5, 5'd6, 5'd5));
+                load_instruction('h14, encode_r(ADD, 5'd5, 5'd1, 5'd1));
+                load_instruction('h18, encode_r(ADD, 5'd5, 5'd2, 5'd2));
+                load_instruction('h1C, encode_i(LUI, 5'd0, 5'd3, 16'h4000));
+                load_instruction('h20, encode_i(ADDI, 5'd0, 5'd4, 16'(PASSES)));
+                load_instruction('h24, encode_i(LOAD, 5'd1, 5'd5, 16'd0));            // R5 = x[i]
+                load_instruction('h28, encode_i(LOAD, 5'd2, 5'd6, 16'd0));            // R6 = y[i]
+                load_instruction('h2C, encode_fma(5'd3, 5'd5, 5'd6, 5'd6));           // R6 = a * x + y
+                load_instruction('h30, encode_i(STORE, 5'd2, 5'd6, 16'd0));           // y[i] = R6
+                load_instruction('h34, encode_i(ADDI, 5'd1, 5'd1, 16'd1024));
+                load_instruction('h38, encode_i(ADDI, 5'd2, 5'd2, 16'd1024));
+                load_instruction('h3C, encode_i(SUBI, 5'd4, 5'd4, 16'd1));
+                load_instruction('h40, encode_branch(BNE, 5'd4, 5'd0, 8'hE4, 8'h04)); // -> 0x24, join at 0x44
+                load_instruction('h44, DONE_INSTR);
+
+                // x[e] = e % 4 + 1, y[e] = (e / 4) % 3 + 1, as FP32. Small integers keep 2x + y exact.
+                for (int e = 0; e < N; ++e) begin
+                    load_instruction(X_BASE + 32'(4 * e), fp32_value(e % 4 + 1));
+                    load_instruction(Y_BASE + 32'(4 * e), fp32_value((e / 4) % 3 + 1));
+                end
+
+                // Every thread gets the same bases; the kernel adds its own offset
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; ++sw) begin
+                        set_all_lanes(3'(w), 2'(sw), 5'd1, X_BASE);
+                        set_all_lanes(3'(w), 2'(sw), 5'd2, Y_BASE);
                     end
                 end
+
+                $display("\n\nSAXPY (%0d warps)", i);
+
+                thread_ops = 0; counting = 1;
+                launch_kernel(4'(i));
+                wait_for_kernel_done(200000);
+                counting = 0;
+
+                // Per warp: (9 setup + 16 passes x 8) instructions x 32 threads, DONE not counted
+                assert (thread_ops == (9 + PASSES * 8) * 32 * i)
+                    else $fatal(1, "SAXPY: thread_ops = %0d, expected %0d", thread_ops, (9 + PASSES * 8) * 32 * i);
+
+                // DDR after the flush: y = 2x + y where a warp of this run owns the element, x unchanged
+                errors = 0;
+                for (int e = 0; e < N; ++e) begin
+                    logic [31:0] x_got, y_got, y_exp;
+                    int xv, yv;
+
+                    xv = e % 4 + 1;
+                    yv = (e / 4) % 3 + 1;
+                    y_exp = ((e / 32) % 8 < i) ? fp32_value(2 * xv + yv) : fp32_value(yv);
+                    x_got = read_word(X_BASE + 32'(4 * e));
+                    y_got = read_word(Y_BASE + 32'(4 * e));
+
+                    if (x_got != fp32_value(xv) || y_got != y_exp) begin
+                        if (errors < 5)
+                            $error("SAXPY: element %0d: x = %h (expected %h), y = %h (expected %h)",
+                                    e, x_got, fp32_value(xv), y_got, y_exp);
+                        errors++;
+                    end
+                end
+                if (errors > 0) $fatal(1, "SAXPY: %0d wrong elements in DDR", errors);
+
+                // Registers after the last pass
+                for (int w = 0; w < i; ++w) begin
+                    for (int sw = 0; sw < 4; ++sw) begin
+                        for (int lane = 0; lane < 8; ++lane) begin
+                            int t, e_last;
+                            logic [31:0] offset;
+
+                            t = sw * 8 + lane;
+                            offset = 32'(128 * w + 4 * t);
+                            e_last = (PASSES - 1) * 256 + w * 32 + t;
+
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd1, X_BASE + offset + 32'(PASSES * 1024));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd2, Y_BASE + offset + 32'(PASSES * 1024));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd3, 32'h4000_0000);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd4, 32'd0);
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd5, fp32_value(e_last % 4 + 1));
+                            check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd6,
+                                fp32_value(2 * (e_last % 4 + 1) + (e_last / 4) % 3 + 1));
+                        end
+                    end
+                end
+
+                display_results(i);
+                display_memory_results();
+                // per warp: 32 loads, 16 stores, 32 misses (every x and y line once; STORE y hits).
+                // Warp w only uses sets w and w + 8, 8 x + 8 y lines each, so most dirty y lines are
+                // evicted during the run and the last ones are flushed.
+                check_memory_counts("SAXPY", 32 * i, 16 * i, 32 * i, 12 * i, 4 * i);
             end
         end
 

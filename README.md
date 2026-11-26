@@ -107,6 +107,7 @@ Custom **32-bit, MIPS-inspired ISA** with GPU-specific branch and thread-identit
 | FMA | `FMA` | opcode | src1 | src2 | src3 [15:11], dst [10:6], unused [5:0] |
 | R-type (int ALU) | `ADD`, `SUB`, `MUL`, `AND`, `OR`, `SLT` | opcode | src1 | src2 | dst [15:11], unused [10:0] |
 | I-type (load/store/imm) | `ADDI`, `SUBI`, `LUI`, `ANDI`, `ORI`, `SLTI`, `LOAD`, `STORE` | opcode | base reg (src1) | dst (src2 for `STORE`) | immediate [15:0] |
+| Shift (imm) | `SLLI`, `SRAI` | opcode | src1 | dst | shift amount [4:0], unused [15:5] |
 | Branch | `BEQ`, `BNE`, `BLT`, `BGE` | opcode | src1 | src2 | target_offset [15:8], reconv_offset [7:0] |
 | Special | `MOV_TID`, `MOV_WID`, `MOV_BID` | opcode | dst | unused | unused |
 | Control | `NOP`, `DONE` | opcode | unused | unused | unused |

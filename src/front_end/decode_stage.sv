@@ -30,6 +30,7 @@ module decode_stage (
     output logic [31:0] instr_pc_q
 );
     localparam R_TYPE = 3'b000, I_TYPE = 3'b001, FMA = 3'b010, BRANCH = 3'b011, SPECIAL = 3'b100;
+    localparam SHIFT = 3'b101;
     
     logic [2:0] format;
     logic [5:0] opcode;
@@ -74,6 +75,10 @@ module decode_stage (
                 alu_valid = 1'b1;
             end
             I_TYPE : begin
+                dst = instr[20:16];
+                alu_valid = 1'b1;
+            end
+            SHIFT : begin // same fields as I-type, shift amount in imm[4:0]
                 dst = instr[20:16];
                 alu_valid = 1'b1;
             end

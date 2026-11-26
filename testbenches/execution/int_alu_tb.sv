@@ -68,6 +68,9 @@ module int_alu_tb;
     localparam [5:0] ANDI = 6'b001011, ORI = 6'b001100, SLTI = 6'b001101;
     localparam [5:0] LOAD = 6'b001110, STORE = 6'b001111;
 
+    // Shift-immediate instructions
+    localparam [5:0] SLLI = 6'b101000, SRAI = 6'b101001;
+
     // Branch instructions
     localparam [5:0] BEQ = 6'b011000, BNE = 6'b011001;
     localparam [5:0] BLT = 6'b011010, BGE = 6'b011011;
@@ -189,7 +192,7 @@ module int_alu_tb;
 
         // I-type: the second operand is the 16-bit immediate, not src2
         $display("\nLUI");
-        drive(LUI, 32'h0000_ABCD, 32'b0, 32'b0, 16'b0);
+        drive(LUI, 32'hDEAD_BEEF, 32'b0, 32'b0, 16'hABCD); // value comes from the immediate; src1 is ignored
         check_result(result, 32'hABCD_0000);
 
         $display("ADDI");
@@ -213,6 +216,34 @@ module int_alu_tb;
         check_result(result, 32'd1);
         drive(SLTI, 32'd7, 32'b0, 32'b0, 16'd5);
         check_result(result, 32'd0);
+
+        // Shifts: the amount is offset[4:0]; the upper offset bits and src2 are ignored
+        $display("SLLI (by 2, by 11, by 0, by 31, upper offset bits ignored)");
+        drive(SLLI, 32'd5, 32'hDEAD, 32'b0, 16'd2);
+        check_result(result, 32'd20);
+        drive(SLLI, 32'd3, 32'b0, 32'b0, 16'd11);
+        check_result(result, 32'd6144);
+        drive(SLLI, 32'h1234_5678, 32'b0, 32'b0, 16'd0);
+        check_result(result, 32'h1234_5678);
+        drive(SLLI, 32'd1, 32'b0, 32'b0, 16'd31);
+        check_result(result, 32'h8000_0000);
+        drive(SLLI, 32'd1, 32'b0, 32'b0, 16'hFFE1); // only [4:0] = 1 counts
+        check_result(result, 32'd2);
+
+        $display("SRAI (positive, negative keeps sign, by 0, by 31)");
+        drive(SRAI, 32'd100, 32'b0, 32'b0, 16'd2);
+        check_result(result, 32'd25);
+        drive(SRAI, 32'hFFFF_FF00, 32'b0, 32'b0, 16'd4); // -256 >> 4 = -16
+        check_result(result, 32'hFFFF_FFF0);
+        drive(SRAI, 32'h8000_0000, 32'b0, 32'b0, 16'd0);
+        check_result(result, 32'h8000_0000);
+        drive(SRAI, 32'h8000_0000, 32'b0, 32'b0, 16'd31);
+        check_result(result, 32'hFFFF_FFFF);
+        drive(SRAI, 32'h7FFF_FFFF, 32'b0, 32'b0, 16'd31);
+        check_result(result, 32'd0);
+        check_bit(is_load, 1'b0);
+        check_bit(is_store, 1'b0);
+        check_bit(is_branch, 1'b0);
 
         $display("LOAD: address = base + offset, is_load set, nothing else tagged");
         drive(LOAD, 32'h0000_1000, 32'b0, 32'b0, 16'd16);

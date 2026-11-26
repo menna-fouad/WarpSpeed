@@ -41,7 +41,7 @@ module int_alu (
     output logic [31:0] src2_out // for store instruction
 );
     // Define parameters for instruction types
-    localparam R_TYPE = 3'b000, I_TYPE = 3'b001, BRANCH = 3'b011;
+    localparam R_TYPE = 3'b000, I_TYPE = 3'b001, BRANCH = 3'b011, SHIFT = 3'b101;
 
     // Define parameters for specific instructions
     // R-type instructions
@@ -53,6 +53,9 @@ module int_alu (
     localparam [2:0] LUI = 3'b000, ADDI = 3'b001, SUBI = 3'b010;
     localparam [2:0] ANDI = 3'b011, ORI = 3'b100, SLTI = 3'b101;
     localparam [2:0] LOAD = 3'b110, STORE = 3'b111;
+
+    // Shift-immediate instructions (I-type fields, shift amount in offset[4:0])
+    localparam [2:0] SLLI = 3'b000, SRAI = 3'b001;
 
     // Branch instructions
     localparam [2:0] BEQ = 3'b000, BNE = 3'b001;
@@ -83,6 +86,12 @@ module int_alu (
                     ANDI : result <= src1 & {{16{offset[15]}}, offset};
                     ORI  : result <= src1 | {{16{offset[15]}}, offset};
                     SLTI : result <= $signed(src1) < $signed({{16{offset[15]}}, offset});
+                    default : result <= 32'b0;
+                endcase
+
+                SHIFT : case (opcode[2:0])
+                    SLLI : result <= src1 << offset[4:0];
+                    SRAI : result <= $signed(src1) >>> offset[4:0];
                     default : result <= 32'b0;
                 endcase
 
