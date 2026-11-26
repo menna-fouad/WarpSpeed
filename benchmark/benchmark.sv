@@ -1,5 +1,5 @@
 `timescale 1ns/1ps
-module performance;
+module benchmark;
     logic sm_clk, sm_reset;
     logic mem_ui_clk, mem_ui_reset;
 
@@ -33,12 +33,22 @@ module performance;
     int stall = 0;
     int issue = 0;
     int flush = 0;
-    int commit_wait = 0;
+    int mem_wait = 0;   // every running warp is busy, and every busy warp is in memory
+    int exec_wait = 0;  // every running warp is busy, and at least one is in execute
     int fetch_wait = 0;
     int empty_sub_warp = 0;
     int other = 0;
 
     sm_top u_sm_top (.*);
+
+    // in_mem[w]: warp w's memory instruction has entered the coalescer and not yet completed
+    logic [7:0] in_mem = '0;
+    always @(posedge sm_clk) begin
+        if (u_sm_top.coalescing.fifo_push) in_mem[u_sm_top.coalescing.incoming_warp] <= 1'b1;
+        if (u_sm_top.lsu.wb_done) in_mem[u_sm_top.lsu.wb_warp] <= 1'b0;
+        for (int w = 0; w < 8; ++w)
+            if (u_sm_top.lsu.store_done[w]) in_mem[w] <= 1'b0;
+    end
 
     always @(posedge sm_clk) begin
         if (counting) begin
@@ -50,7 +60,11 @@ module performance;
                 issue <= issue + 1;
             else if (u_sm_top.dec_sub_warp_valid) empty_sub_warp <= empty_sub_warp + 1;
             else if (u_sm_top.warps_done) flush <= flush + 1;
-            else if (|u_sm_top.u_warp_scheduler.instr_busy) commit_wait <= commit_wait + 1;
+            else if (&(u_sm_top.u_warp_scheduler.instr_busy | u_sm_top.u_warp_scheduler.finished)) begin
+                // every running warp has an instruction in flight
+                if (&(in_mem | ~u_sm_top.u_warp_scheduler.instr_busy)) mem_wait <= mem_wait + 1;
+                else exec_wait <= exec_wait + 1;
+            end
             else if (!u_sm_top.u_fetch.buf_valid) fetch_wait <= fetch_wait + 1;
             else other <= other + 1;
         end
@@ -237,7 +251,8 @@ module performance;
         stall = 0;
         issue = 0;
         flush = 0;
-        commit_wait = 0;
+        mem_wait = 0;
+        exec_wait = 0;
         fetch_wait = 0;
         empty_sub_warp = 0;
         other = 0;
@@ -602,9 +617,14 @@ module performance;
         $display("\tEmpty sub warps: %0d", empty_sub_warp);
         $display("\tWriteback stalls: %0d", stall);
         $display("\tFetch Stalls: %0d", fetch_wait);
-        $display("\tCommit Stalls: %0d", commit_wait);
+        $display("\tMemory Stalls: %0d", mem_wait);
+        $display("\tExecute Stalls: %0d", exec_wait);
         $display("\tFlush: %0d", flush);
         $display("\tOther: %0d\n", other);
+
+        assert (stall + issue + empty_sub_warp + flush + mem_wait + exec_wait + fetch_wait + other == cycle_count)
+            else $error("Lost-cycle rows sum to %0d, cycle_count is %0d",
+                   stall + issue + empty_sub_warp + flush + mem_wait + exec_wait + fetch_wait + other, cycle_count);
     endtask
 
     task automatic display_memory_results();
