@@ -113,6 +113,122 @@ module performance;
         end
     end
 
+    int ld_count = 0;
+    int ld_sum = 0;
+    int ld_min = 32'h7FFF_FFFF;
+    int ld_max = 0;
+
+    int st_count = 0;
+    int st_sum = 0;
+    int st_min = 32'h7FFF_FFFF;
+    int st_max = 0;
+
+    int start [7:0];       // "customer walks in": instruction fully arrived at the coalescer
+    int issue_start [7:0]; // "reaches the counter": coalescer starts issuing its D$ requests
+
+    // queue = issue_start - start (waiting behind other warps), service = end - issue_start
+    int ld_queue_sum = 0;
+    int ld_service_sum = 0;
+    int st_queue_sum = 0;
+    int st_service_sum = 0;
+
+    always @(posedge sm_clk) begin
+        int latency;
+
+        if (counting) begin
+            if (u_sm_top.coalescing.fifo_push)
+                start[u_sm_top.coalescing.incoming_warp] <= cycle_count;
+
+            // Two ways to reach the counter: popped from the line, or the line was empty
+            // and the instruction went straight in (then queue time is 0)
+            if (u_sm_top.coalescing.fifo_pop)
+                issue_start[u_sm_top.coalescing.ready_fifo[0]] <= cycle_count;
+            else if (u_sm_top.coalescing.direct_handoff)
+                issue_start[u_sm_top.coalescing.incoming_warp] <= cycle_count;
+
+            if (u_sm_top.lsu.wb_done) begin
+                latency = cycle_count - start[u_sm_top.lsu.wb_warp];
+                ld_sum <= ld_sum + latency;
+                ld_count <= ld_count + 1;
+
+                ld_queue_sum <= ld_queue_sum + (issue_start[u_sm_top.lsu.wb_warp] - start[u_sm_top.lsu.wb_warp]);
+                ld_service_sum <= ld_service_sum + (cycle_count - issue_start[u_sm_top.lsu.wb_warp]);
+
+                if (latency < ld_min)
+                    ld_min <= latency;
+                
+                if (latency > ld_max)
+                    ld_max <= latency;
+            end
+
+            for (int w = 0; w < 8; ++w) begin
+                if (u_sm_top.lsu.store_done[w]) begin
+                    latency = cycle_count - start[w];
+                    st_sum <= st_sum + latency;
+                    st_count <= st_count + 1;
+
+                    st_queue_sum <= st_queue_sum + (issue_start[w] - start[w]);
+                    st_service_sum <= st_service_sum + (cycle_count - issue_start[w]);
+
+                    if (latency < st_min) 
+                        st_min <= latency;
+                    
+                    if (latency > st_max)
+                        st_max <= latency;
+                end
+            end
+        end
+    end
+
+    // One D$ fill ("back-room trip"):
+    //   t0 = fill request accepted, t1 = first beat back, t2 = last beat back
+    //   wait = t1 - t0 (trip to DDR), transfer = t2 - t1 (receiving the 8 beats)
+    // The D$ is blocking, so only one fill is ever in flight: no per-warp array needed.
+    int fill_count = 0;
+    int fill_wait_sum = 0;
+    int fill_transfer_sum = 0;
+    int fill_wait_min = 32'h7FFF_FFFF;
+    int fill_wait_max = 0;
+    int fill_transfer_min = 32'h7FFF_FFFF;
+    int fill_transfer_max = 0;
+
+    int fill_t0, fill_t1;
+    bit fill_waiting_first = 0; // between t0 and the first beat
+
+    always @(posedge sm_clk) begin
+        int wait_cycles, transfer_cycles;
+
+        if (counting) begin
+            // t0: same event dc_miss counts
+            if (u_sm_top.dcache_mem_req_valid && u_sm_top.dcache_mem_req_ready
+                && !u_sm_top.dcache_mem_req_write) begin
+                fill_t0 <= cycle_count;
+                fill_waiting_first <= 1'b1;
+            end
+
+            // t1: first beat after t0
+            if (u_sm_top.dcache_mem_rvalid && fill_waiting_first) begin
+                fill_t1 <= cycle_count;
+                fill_waiting_first <= 1'b0;
+
+                wait_cycles = cycle_count - fill_t0;
+                fill_wait_sum <= fill_wait_sum + wait_cycles;
+                if (wait_cycles < fill_wait_min) fill_wait_min <= wait_cycles;
+                if (wait_cycles > fill_wait_max) fill_wait_max <= wait_cycles;
+            end
+
+            // t2: last beat. fill_t1 is read before this edge's update, which is fine:
+            // a line is 8 beats, so the first and last beat are never in the same cycle
+            if (u_sm_top.dcache_mem_rvalid && u_sm_top.dcache_mem_rlast) begin
+                transfer_cycles = cycle_count - fill_t1;
+                fill_transfer_sum <= fill_transfer_sum + transfer_cycles;
+                fill_count <= fill_count + 1;
+                if (transfer_cycles < fill_transfer_min) fill_transfer_min <= transfer_cycles;
+                if (transfer_cycles > fill_transfer_max) fill_transfer_max <= transfer_cycles;
+            end
+        end
+    end
+
     task reset_counts;
         thread_ops = 0;
         cycle_count = 0;
@@ -140,6 +256,30 @@ module performance;
         dc_wr_beats = 0;
         ic_rd_beats = 0;
         dc_blocked = 0;
+
+        ld_count = 0;
+        ld_sum = 0;
+        ld_min = 32'h7FFF_FFFF;
+        ld_max = 0;
+
+        st_count = 0;
+        st_sum = 0;
+        st_min = 32'h7FFF_FFFF;
+        st_max = 0;
+
+        ld_queue_sum = 0;
+        ld_service_sum = 0;
+        st_queue_sum = 0;
+        st_service_sum = 0;
+
+        fill_count = 0;
+        fill_wait_sum = 0;
+        fill_transfer_sum = 0;
+        fill_wait_min = 32'h7FFF_FFFF;
+        fill_wait_max = 0;
+        fill_transfer_min = 32'h7FFF_FFFF;
+        fill_transfer_max = 0;
+        fill_waiting_first = 0;
     endtask
 
     // fake MIG
@@ -468,6 +608,9 @@ module performance;
     endtask
 
     task automatic display_memory_results();
+        int total_beats;
+        real bytes, bytes_per_cycle, mb_per_s;
+
         if (dc_access > 0) begin
             $display("Coalescing ratio: %0.2f", real'(mem_txns)/mem_instrs);
             $display("D$ hit rate: %0.2f", real'(dc_access - dc_miss)/dc_access);
@@ -483,8 +626,21 @@ module performance;
             $display("I$ MPKI: %0.2f\n", real'(ic_miss * 1000)/instr_count);
         end
 
-        int total_beats;
-        real bytes, bytes_per_cycle, mb_per_s;
+        if (ld_count > 0)
+            $display("Load latency:  avg %0.1f | min %0d | max %0d cycles (%0d loads)",
+                     real'(ld_sum) / ld_count, ld_min, ld_max, ld_count);
+        if (ld_count > 0)
+            $display("\tqueue %0.1f + service %0.1f", real'(ld_queue_sum) / ld_count, real'(ld_service_sum) / ld_count);
+        if (st_count > 0) begin
+            $display("Store latency: avg %0.1f | min %0d | max %0d cycles (%0d stores)",
+                     real'(st_sum) / st_count, st_min, st_max, st_count);
+            $display("\tqueue %0.1f + service %0.1f", real'(st_queue_sum) / st_count, real'(st_service_sum) / st_count);
+        end
+        if (fill_count > 0)
+            $display("D$ fill: wait avg %0.1f (min %0d, max %0d) + transfer avg %0.1f (min %0d, max %0d) cycles (%0d fills)",
+                     real'(fill_wait_sum) / fill_count, fill_wait_min, fill_wait_max,
+                     real'(fill_transfer_sum) / fill_count, fill_transfer_min, fill_transfer_max, fill_count);
+        $display("");
 
         total_beats = dc_rd_beats + dc_wr_beats + ic_rd_beats;
         bytes = 16.0 * total_beats;
@@ -510,6 +666,33 @@ module performance;
             else $error("ic_rd_beats (%0d) != 8 * ic_miss (%0d)", ic_rd_beats, 8 * ic_miss);
         assert (dc_wr_beats % 8 == 0 && dc_wr_beats >= 8 * dc_wb)
             else $error("dc_wr_beats (%0d) is not whole lines covering dc_wb (%0d)", dc_wr_beats, dc_wb);
+        assert (ld_count + st_count == mem_instrs)
+            else $error("ld_count (%0d) + st_count (%0d) != mem_instrs (%0d)", ld_count, st_count, mem_instrs);
+        // queue + service is the same span as the total latency, split at issue start
+        assert (ld_queue_sum + ld_service_sum == ld_sum && st_queue_sum + st_service_sum == st_sum)
+            else $error("queue + service doesn't add up to total latency");
+        // every miss is exactly one fill
+        assert (fill_count == dc_miss)
+            else $error("fill_count (%0d) != dc_miss (%0d)", fill_count, dc_miss);
+    endtask
+
+    // Per-kernel expected memory counts, derived by hand from the access traces
+    task automatic check_memory_counts(
+        input string name,
+        input int loads, stores, misses, evictions, flushed
+    );
+        assert (ld_count == loads)
+            else $error("%s: ld_count = %0d, expected %0d", name, ld_count, loads);
+        assert (st_count == stores)
+            else $error("%s: st_count = %0d, expected %0d", name, st_count, stores);
+        assert (dc_miss == misses)
+            else $error("%s: dc_miss = %0d, expected %0d", name, dc_miss, misses);
+        assert (dc_wb == evictions)
+            else $error("%s: dc_wb = %0d, expected %0d", name, dc_wb, evictions);
+        assert (dc_wr_beats / 8 - dc_wb == flushed)
+            else $error("%s: flush writebacks = %0d, expected %0d", name, dc_wr_beats / 8 - dc_wb, flushed);
+        assert (ic_miss == 1)
+            else $error("%s: ic_miss = %0d, expected 1 (kernel fits in one I$ line)", name, ic_miss);
     endtask
     
     initial begin
@@ -801,6 +984,8 @@ module performance;
 
                 display_results(i);
                 display_memory_results();
+                // per warp: 3 loads, 2 stores, 4 compulsory misses, no evictions (each used set holds exactly 4 lines), 4 flushed
+                check_memory_counts("Multi-warp memory", 3 * i, 2 * i, 4 * i, 0, 4 * i);
             end
         end
 
@@ -971,6 +1156,8 @@ module performance;
 
                 display_results(i);
                 display_memory_results();
+                // per warp: 5 loads, 8 stores, 7 misses (6 compulsory + A reload), 3 dirty evictions (A, C, B), 3 flushed (D, E, F)
+                check_memory_counts("Full system", 5 * i, 8 * i, 7 * i, 3 * i, 3 * i);
             end
         end
 
