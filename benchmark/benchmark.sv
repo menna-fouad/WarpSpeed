@@ -632,6 +632,15 @@ module benchmark;
         endcase
     endfunction
 
+    // Exact FP32 bits of a non-negative integer below 2^24
+    function automatic logic [31:0] int_to_fp32(input int v);
+        int p;
+        if (v == 0) return 32'h0;
+        if (v < 0 || v >= (1 << 24)) $fatal(1, "int_to_fp32: %0d is out of range", v);
+        p = $clog2(v + 1) - 1;                                          // index of the top set bit
+        return {1'b0, 8'(127 + p), 23'((v << (23 - p)) & 32'h007F_FFFF)}; // drop the hidden 1
+    endfunction
+
     task automatic display_results(input logic [3:0] warps);
         $display("RESULTS");
         $display("Thread-ops: %0d | Thread-ops/cycle: %0.2f", thread_ops, real'(thread_ops)/cycle_count);
@@ -1379,6 +1388,7 @@ module benchmark;
             0x44 DONE
         */
 
+        begin
         localparam int N = 4096;
         localparam int PASSES = 16;
         localparam logic [31:0] X_BASE = 32'h0000_1000; // x: 0x1000 - 0x4FFF
@@ -1485,6 +1495,174 @@ module benchmark;
                 // Warp w only uses sets w and w + 8, 8 x + 8 y lines each, so most dirty y lines are
                 // evicted during the run and the last ones are flushed.
                 check_memory_counts("SAXPY", 32 * i, 16 * i, 32 * i, 12 * i, 4 * i);
+            end
+        end
+        end
+
+        $display("Matrix-Vector Kernel");
+
+        /*
+            matrix A (256 x 64) calculations
+                // element = column * 256 + warp * 32 + thread
+                // address = base + 4 * element
+                // address = base + step * 1024 + warp * 128 + thread * 4
+
+            vector x (64 elements) calculations
+                // element = column
+                // address = base + column * 4
+
+            vector y (256 elements) calculations
+                // element = warp * 32 + thread
+                // address = base + warp * 128 + thread * 4
+
+            // base for A in R1
+            // base for x in R2
+            // base for y in R3
+
+            0x00 MOV_WID R6                 // R6 = warp (0–7)
+            0x04 SLLI R6, R6, 7             // R6 = warp × 128
+            0x08 MOV_TID R7                 // R7 = thread (0–31)
+            0x0C SLLI R7, R7, 2             // R7 = thread × 4
+            0x10 ADD R6, R6, R7             // R6 = warp×128 + thread×4  (this thread's row offset)
+            0x14 ADD R1, R1, R6             // R1 = address of A[r][0]
+            0x18 ADD R3, R3, R6             // R3 = address of y[r]  (x gets no offset: all threads read x[c])
+            0x1C ADDI R4, R0, 64            // R4 = 64 columns left
+            0x20 ADDI R5, R0, 0             // R5 = acc = 0.0f (0x00000000)
+
+        loop:
+            0x24 LOAD R9, 0(R1)             // R9 = A[r][c]
+            0x28 LOAD R10, 0(R2)            // R10 = x[c]
+            0x2C FMA R5, R9, R10, R5        // acc = A[r][c] × x[c] + acc
+
+            0x30 ADDI R1, R1, 1024          // A address → next column (256 rows × 4 B)
+            0x34 ADDI R2, R2, 4             // x address → next element
+            0x38 SUBI R4, R4, 1             // one fewer column left
+
+            0x3C BNE R4, R0, LOOP           // target_offset = -0x18 (0xE8) → 0x24, recon_offset = 0x04 → 0x40
+
+            0x40 STORE R5, 0(R3)            // y[r] = acc
+            0x44 DONE
+        */
+
+        // Column-major A: A[r][c] at A_BASE + 4 * (c * 256 + r). One thread per row (r = warp * 32 + thread),
+        begin
+            localparam int M = 256;                         // rows (one per thread at 8 warps)
+            localparam int N = 64;                          // columns
+            localparam logic [31:0] A_BASE = 32'h0001_0000; // A: 0x10000 - 0x1FFFF (64 KiB)
+            localparam logic [31:0] X_BASE = 32'h0000_2000; // x: 0x2000 - 0x20FF (2 lines)
+            localparam logic [31:0] Y_BASE = 32'h0000_3000; // y: 0x3000 - 0x33FF (8 lines)
+            localparam logic [31:0] Y_UNTOUCHED = 32'hDEAD_BEEF;
+            int errors;
+
+            for (int i = 0; i < 9; ++i) begin
+                if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                    reset();
+                    reset_counts();
+                    mig_mem.delete();
+                    initialize_all_lanes();
+
+                    load_instruction('h00, encode_special(MOV_WID, 5'd6));
+                    load_instruction('h04, encode_shift(SLLI, 5'd6, 5'd6, 5'd7));
+                    load_instruction('h08, encode_special(MOV_TID, 5'd7));
+                    load_instruction('h0C, encode_shift(SLLI, 5'd7, 5'd7, 5'd2));
+                    load_instruction('h10, encode_r(ADD, 5'd6, 5'd7, 5'd6));
+                    load_instruction('h14, encode_r(ADD, 5'd1, 5'd6, 5'd1));
+                    load_instruction('h18, encode_r(ADD, 5'd3, 5'd6, 5'd3));
+                    load_instruction('h1C, encode_i(ADDI, 5'd0, 5'd4, 16'(N)));
+                    load_instruction('h20, encode_i(ADDI, 5'd0, 5'd5, 16'd0));           // acc = 0.0f
+                    load_instruction('h24, encode_i(LOAD, 5'd1, 5'd9, 16'd0));           // R9 = A[r][c]
+                    load_instruction('h28, encode_i(LOAD, 5'd2, 5'd10, 16'd0));          // R10 = x[c]
+                    load_instruction('h2C, encode_fma(5'd9, 5'd10, 5'd5, 5'd5));         // acc = A * x + acc
+                    load_instruction('h30, encode_i(ADDI, 5'd1, 5'd1, 16'(4 * M)));      // next column of A
+                    load_instruction('h34, encode_i(ADDI, 5'd2, 5'd2, 16'd4));           // next x
+                    load_instruction('h38, encode_i(SUBI, 5'd4, 5'd4, 16'd1));
+                    load_instruction('h3C, encode_branch(BNE, 5'd4, 5'd0, 8'hE8, 8'h04)); // -> 0x24, join at 0x40
+                    load_instruction('h40, encode_i(STORE, 5'd3, 5'd5, 16'd0));          // y[r] = acc
+                    load_instruction('h44, DONE_INSTR);
+
+                    // A[r][c] = (r + c) % 4 + 1, x[c] = c % 3 + 1
+                    for (int c = 0; c < N; ++c) begin
+                        load_instruction(X_BASE + 32'(4 * c), int_to_fp32(c % 3 + 1));
+                        for (int r = 0; r < M; ++r)
+                            load_instruction(A_BASE + 32'(4 * (c * M + r)), int_to_fp32((r + c) % 4 + 1));
+                    end
+                    for (int r = 0; r < M; ++r)
+                        load_instruction(Y_BASE + 32'(4 * r), Y_UNTOUCHED);
+
+                    // Every thread gets the same bases, the kernel adds its own row offset to A and y
+                    for (int w = 0; w < i; ++w) begin
+                        for (int sw = 0; sw < 4; ++sw) begin
+                            set_all_lanes(3'(w), 2'(sw), 5'd1, A_BASE);
+                            set_all_lanes(3'(w), 2'(sw), 5'd2, X_BASE);
+                            set_all_lanes(3'(w), 2'(sw), 5'd3, Y_BASE);
+                        end
+                    end
+
+                    $display("\n\nMatrix-Vector (%0d warps)", i);
+
+                    thread_ops = 0; counting = 1;
+                    launch_kernel(4'(i));
+                    wait_for_kernel_done(400000);
+                    counting = 0;
+
+                    // Per warp: (9 setup + 64 passes x 7 + STORE) instructions x 32 threads, DONE not counted
+                    assert (thread_ops == (9 + N * 7 + 1) * 32 * i)
+                        else $fatal(1, "Matrix-vector: thread_ops = %0d, expected %0d", thread_ops, (9 + N * 7 + 1) * 32 * i);
+
+                    // DDR after the flush: y[r] = sum_c A[r][c] * x[c] for computed rows, untouched otherwise
+                    errors = 0;
+                    for (int r = 0; r < M; ++r) begin
+                        int sum;
+                        logic [31:0] y_got, y_exp;
+
+                        sum = 0;
+                        for (int c = 0; c < N; ++c)
+                            sum += ((r + c) % 4 + 1) * (c % 3 + 1);
+                        y_exp = (r / 32 < i) ? int_to_fp32(sum) : Y_UNTOUCHED;
+                        y_got = read_word(Y_BASE + 32'(4 * r));
+
+                        if (y_got != y_exp) begin
+                            if (errors < 5)
+                                $error("Matrix-vector: y[%0d] = %h, expected %h", r, y_got, y_exp);
+                            errors++;
+                        end
+                    end
+                    if (errors > 0) $fatal(1, "Matrix-vector: %0d wrong rows of y in DDR", errors);
+
+                    // Registers after the loop
+                    for (int w = 0; w < i; ++w) begin
+                        for (int sw = 0; sw < 4; ++sw) begin
+                            for (int lane = 0; lane < 8; ++lane) begin
+                                int t, r, sum;
+                                logic [31:0] offset;
+
+                                t = sw * 8 + lane;
+                                r = w * 32 + t;
+                                offset = 32'(128 * w + 4 * t);
+                                sum = 0;
+                                for (int c = 0; c < N; ++c)
+                                    sum += ((r + c) % 4 + 1) * (c % 3 + 1);
+
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd1, A_BASE + offset + 32'(N * 4 * M));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd2, X_BASE + 32'(4 * N));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd3, Y_BASE + offset);
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd4, 32'd0);
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd5, int_to_fp32(sum));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd6, offset);
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd9, int_to_fp32((r + N - 1) % 4 + 1));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd10, int_to_fp32((N - 1) % 3 + 1));
+                            end
+                        end
+                    end
+
+                    display_results(i);
+                    display_memory_results();
+                    // per warp: 128 loads (64 A + 64 x), 1 store. Misses: all 64 A lines + the y line (write-allocate),
+                    // plus x's 2 lines once for the whole run (x is reused by every warp and kept by PLRU).
+                    // Warp w's y line sits in set w, which only warp w's own A lines use, so it is never evicted
+                    // and goes out in the flush.
+                    check_memory_counts("Matrix-vector", 128 * i, 1 * i, 65 * i + 2, 0, 1 * i);
+                end
             end
         end
 
