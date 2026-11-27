@@ -83,16 +83,28 @@ module recon_stack # (
                         next_free <= next_free + 2;
                     end
                     2'd1: begin
-                        if (skip_not_taken) begin
-                            masks[next_free] <= push2_mask_taken;
-                            pcs[next_free] <= push2_pc_taken;
-                            recon_pcs[next_free] <= push2_recon_pc;
+                        if (push2_recon_pc == recon_pcs[top_valid]) begin
+                            if (skip_not_taken) begin
+                                masks[next_free-1] <= push2_mask_taken;
+                                pcs[next_free-1] <= push2_pc_taken;
+                                recon_pcs[next_free-1] <= push2_recon_pc;
+                            end else begin
+                                masks[next_free-1] <= push2_mask_not_taken;
+                                pcs[next_free-1] <= push2_pc_fallthrough;
+                                recon_pcs[next_free-1] <= push2_recon_pc;
+                            end
                         end else begin
-                            masks[next_free] <= push2_mask_not_taken;
-                            pcs[next_free] <= push2_pc_fallthrough;
-                            recon_pcs[next_free] <= push2_recon_pc;
+                            if (skip_not_taken) begin
+                                masks[next_free] <= push2_mask_taken;
+                                pcs[next_free] <= push2_pc_taken;
+                                recon_pcs[next_free] <= push2_recon_pc;
+                            end else begin
+                                masks[next_free] <= push2_mask_not_taken;
+                                pcs[next_free] <= push2_pc_fallthrough;
+                                recon_pcs[next_free] <= push2_recon_pc;
+                            end
+                            next_free <= next_free + 1;
                         end
-                        next_free <= next_free + 1;
                     end
                     2'd0: begin
                         if (push2_recon_pc == recon_pcs[top_valid])

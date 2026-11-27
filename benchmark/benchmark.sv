@@ -641,6 +641,25 @@ module benchmark;
         return {1'b0, 8'(127 + p), 23'((v << (23 - p)) & 32'h007F_FFFF)}; // drop the hidden 1
     endfunction
 
+    // Mandelbrot reference, Q12 fixed point
+    // Returns the step count (max 32) and the final zx, zy the kernel leaves in R14, R15.
+    function automatic int mandel_pixel(input int px, py, output int zx, zy);
+        int cx, cy, zx2, zy2, zxzy, steps;
+        cx = -8192 + px * 307;
+        cy = -4096 + py * 1365;
+        zx = 0; zy = 0; steps = 0;
+        do begin
+            zx2 = (zx * zx) >>> 12;
+            zy2 = (zy * zy) >>> 12;
+            if (zx2 + zy2 > 16384) break;
+            zxzy = (zx * zy) >>> 12;
+            zy = zxzy + zxzy + cy;
+            zx = zx2 - zy2 + cx;
+            steps++;
+        end while (steps < 32);
+        return steps;
+    endfunction
+
     task automatic display_results(input logic [3:0] warps);
         $display("RESULTS");
         $display("Thread-ops: %0d | Thread-ops/cycle: %0.2f", thread_ops, real'(thread_ops)/cycle_count);
@@ -731,7 +750,8 @@ module benchmark;
     // Per-kernel expected memory counts, derived by hand from the access traces
     task automatic check_memory_counts(
         input string name,
-        input int loads, stores, misses, evictions, flushed
+        input int loads, stores, misses, evictions, flushed,
+        input int ic_misses = 1 // I$ lines the kernel spans (128 B each)
     );
         assert (ld_count == loads)
             else $error("%s: ld_count = %0d, expected %0d", name, ld_count, loads);
@@ -743,8 +763,8 @@ module benchmark;
             else $error("%s: dc_wb = %0d, expected %0d", name, dc_wb, evictions);
         assert (dc_wr_beats / 8 - dc_wb == flushed)
             else $error("%s: flush writebacks = %0d, expected %0d", name, dc_wr_beats / 8 - dc_wb, flushed);
-        assert (ic_miss == 1)
-            else $error("%s: ic_miss = %0d, expected 1 (kernel fits in one I$ line)", name, ic_miss);
+        assert (ic_miss == ic_misses)
+            else $error("%s: ic_miss = %0d, expected %0d (one per I$ line of the kernel)", name, ic_miss, ic_misses);
     endtask
     
     initial begin
@@ -1662,6 +1682,258 @@ module benchmark;
                     // Warp w's y line sits in set w, which only warp w's own A lines use, so it is never evicted
                     // and goes out in the flush.
                     check_memory_counts("Matrix-vector", 128 * i, 1 * i, 65 * i + 2, 0, 1 * i);
+                end
+            end
+        end
+
+        $display("Mandelbrot Kernel");
+
+        /*
+            0x00 MOV_WID R1                     // R1 = warp
+            0x04 MOV_TID R2                     // R2 = thread
+            0x08 ADD R3, R1, R0                 // R3 = chunk
+            
+            // constants
+            0x0C ADDI R4, R0, 12                // R4 = 12
+            0x10 ADDI R5, R0, 40                // R5 = 40
+            0x14 ADDI R6, R0, 307               // R6 = 307
+            0x18 ADDI R7, R0, 1365              // R7 = 1365
+            0x1C ADDI R8, R0, 16384             // R8 = 16384
+            0x20 ADDI R9, R0, 32                // R9 = 32
+
+        loop:
+            0x24 ANDI R10, R3, 1
+            0x28 SLLI R10, R10, 5
+            0x2C ADD R10, R10, R2               // R10 = px
+            0x30 SRAI R11, R3, 1                // R11 = py
+
+            0x34 BGE R10, R5, skip              // target_offset = 0x6C, recon_offset = 0x6C
+            0x38 MUL R12, R10, R6            
+            0x3C SUBI R12, R12, 8192            // R12 = cx
+            0x40 MUL R13, R11, R7
+            0x44 SUBI R13, R13, 4096            // R13 = cy
+
+            0x48 ADDI R14, R0, 0                // R14 = zx = 0
+            0x4C ADDI R15, R0, 0                // R15 = zy = 0
+            0x50 ADDI R16, R0, 0                // R16 = steps = 0
+
+        continue_steps:
+            0x54 MUL R17, R14, R14
+            0x58 SRAI R17, R17, 12              // R17 = zx^2
+            0x5C MUL R18, R15, R15
+            0x60 SRAI R18, R18, 12              // R18 = zy^2
+            0x64 ADD R19, R17, R18              // R19 = zx^2 + zy^2
+            0x68 BLT R8, R19, break             // target_offset = 0x24, recon_offset = 0x24
+
+            0x6C MUL R20, R14, R15
+            0x70 SRAI R20, R20, 12              // R20 = zx * zy
+            0x74 SUB R21, R17, R18              // R21 = zx^2 - zy^2
+            0x78 ADD R14, R21, R12              // update zx
+            0x7C ADD R22, R20, R20              // R22 = (zx * zy) + (zx * zy)
+            0x80 ADD R15, R22, R13
+            0x84 ADDI R16, R16, 1               // steps++
+            0x88 BLT R16, R9, continue_steps    // target_offset = -0x34 (0xCC), recon_offset = 0x04
+
+        break:
+            // out[py * 64 + px] = steps;
+            0x8C SLLI R23, R11, 6
+            0x90 ADD R23, R23, R10          // R23 = py * 64 + px -> element
+            0x94 SLLI R23, R23, 2           // R23 = 4 * (py * 64 + px) -> offset
+            0x98 ADD R23, R31, R23          // R23 = address in output
+            0x9C STORE R16, 0(R23)
+
+        skip:
+            // chunk += number of warps (preset in R30)
+            0xA0 ADD R3, R3, R30
+            0xA4 BLT R3, R4, loop          // target_offset = -0x80 (0x80), recon_offset = 0x04
+
+            0xA8 DONE
+        */
+
+        // Image width 40, height 6, 12 chunks of 32 pixels (2 per row). Warp w does chunks w, w + i, w + 2i, ... < 12
+        // (stride = number of warps i, preset in R30), so every warp count draws the whole image.
+        // Output row-major with rows padded to 64 words: out[py][px] at OUT_BASE + 4 * (py * 64 + px),
+        // so chunk k is exactly line k. OUT_BASE is 2048-aligned, so chunk k lands in D$ set k.
+        begin
+            localparam int WIDTH = 40;
+            localparam int HEIGHT = 6;
+            localparam int PITCH = 64;                          // words per output row
+            localparam int CHUNKS = 12;
+            localparam logic [31:0] OUT_BASE = 32'h0000_1000;   // out: 0x1000 - 0x15FF (12 lines)
+            localparam logic [31:0] OUT_UNTOUCHED = 32'hFFFF_FFFF; // -1 = never written
+            int errors, expected_ops;
+
+            for (int i = 0; i < 9; ++i) begin
+                if (i == 1 || i == 2 || i == 4 || i == 8) begin
+                    reset();
+                    reset_counts();
+                    mig_mem.delete();
+                    initialize_all_lanes();
+
+                    load_instruction('h00, encode_special(MOV_WID, 5'd1));                  // R1 = warp
+                    load_instruction('h04, encode_special(MOV_TID, 5'd2));                  // R2 = thread
+                    load_instruction('h08, encode_r(ADD, 5'd1, 5'd0, 5'd3));                // R3 = chunk = warp
+                    load_instruction('h0C, encode_i(ADDI, 5'd0, 5'd4, 16'(CHUNKS)));        // R4 = 12
+                    load_instruction('h10, encode_i(ADDI, 5'd0, 5'd5, 16'(WIDTH)));         // R5 = 40
+                    load_instruction('h14, encode_i(ADDI, 5'd0, 5'd6, 16'd307));            // R6 = x step
+                    load_instruction('h18, encode_i(ADDI, 5'd0, 5'd7, 16'd1365));           // R7 = y step
+                    load_instruction('h1C, encode_i(ADDI, 5'd0, 5'd8, 16'd16384));          // R8 = 4.0
+                    load_instruction('h20, encode_i(ADDI, 5'd0, 5'd9, 16'd32));             // R9 = max steps
+                    // loop:
+                    load_instruction('h24, encode_i(ANDI, 5'd3, 5'd10, 16'd1));
+                    load_instruction('h28, encode_shift(SLLI, 5'd10, 5'd10, 5'd5));
+                    load_instruction('h2C, encode_r(ADD, 5'd10, 5'd2, 5'd10));              // R10 = px
+                    load_instruction('h30, encode_shift(SRAI, 5'd3, 5'd11, 5'd1));          // R11 = py
+                    load_instruction('h34, encode_branch(BGE, 5'd10, 5'd5, 8'h6C, 8'h6C));  // px >= 40 -> skip (0xA0)
+                    load_instruction('h38, encode_r(MUL, 5'd10, 5'd6, 5'd12));
+                    load_instruction('h3C, encode_i(SUBI, 5'd12, 5'd12, 16'd8192));         // R12 = cx
+                    load_instruction('h40, encode_r(MUL, 5'd11, 5'd7, 5'd13));
+                    load_instruction('h44, encode_i(SUBI, 5'd13, 5'd13, 16'd4096));         // R13 = cy
+                    load_instruction('h48, encode_i(ADDI, 5'd0, 5'd14, 16'd0));             // zx = 0
+                    load_instruction('h4C, encode_i(ADDI, 5'd0, 5'd15, 16'd0));             // zy = 0
+                    load_instruction('h50, encode_i(ADDI, 5'd0, 5'd16, 16'd0));             // steps = 0
+                    // continue_steps:
+                    load_instruction('h54, encode_r(MUL, 5'd14, 5'd14, 5'd17));
+                    load_instruction('h58, encode_shift(SRAI, 5'd17, 5'd17, 5'd12));        // R17 = zx^2
+                    load_instruction('h5C, encode_r(MUL, 5'd15, 5'd15, 5'd18));
+                    load_instruction('h60, encode_shift(SRAI, 5'd18, 5'd18, 5'd12));        // R18 = zy^2
+                    load_instruction('h64, encode_r(ADD, 5'd17, 5'd18, 5'd19));             // R19 = |z|^2
+                    load_instruction('h68, encode_branch(BLT, 5'd8, 5'd19, 8'h24, 8'h24));  // escaped -> break (0x8C)
+                    load_instruction('h6C, encode_r(MUL, 5'd14, 5'd15, 5'd20));
+                    load_instruction('h70, encode_shift(SRAI, 5'd20, 5'd20, 5'd12));        // R20 = zx * zy
+                    load_instruction('h74, encode_r(SUB, 5'd17, 5'd18, 5'd21));             // R21 = zx^2 - zy^2
+                    load_instruction('h78, encode_r(ADD, 5'd21, 5'd12, 5'd14));             // zx = R21 + cx
+                    load_instruction('h7C, encode_r(ADD, 5'd20, 5'd20, 5'd22));             // R22 = 2 zx zy
+                    load_instruction('h80, encode_r(ADD, 5'd22, 5'd13, 5'd15));             // zy = R22 + cy
+                    load_instruction('h84, encode_i(ADDI, 5'd16, 5'd16, 16'd1));            // steps++
+                    load_instruction('h88, encode_branch(BLT, 5'd16, 5'd9, 8'hCC, 8'h04));  // -> 0x54, join at 0x8C
+                    // break:
+                    load_instruction('h8C, encode_shift(SLLI, 5'd11, 5'd23, 5'd6));         // py * 64
+                    load_instruction('h90, encode_r(ADD, 5'd23, 5'd10, 5'd23));             // + px
+                    load_instruction('h94, encode_shift(SLLI, 5'd23, 5'd23, 5'd2));         // x 4 bytes
+                    load_instruction('h98, encode_r(ADD, 5'd31, 5'd23, 5'd23));             // + OUT_BASE
+                    load_instruction('h9C, encode_i(STORE, 5'd23, 5'd16, 16'd0));           // out[py][px] = steps
+                    // skip:
+                    load_instruction('hA0, encode_r(ADD, 5'd3, 5'd30, 5'd3));               // chunk += warps
+                    load_instruction('hA4, encode_branch(BLT, 5'd3, 5'd4, 8'h80, 8'h04));   // -> 0x24, join at 0xA8
+                    load_instruction('hA8, DONE_INSTR);
+
+                    for (int k = 0; k < HEIGHT * PITCH; ++k)
+                        load_instruction(OUT_BASE + 32'(4 * k), OUT_UNTOUCHED);
+
+                    for (int w = 0; w < i; ++w)
+                        for (int sw = 0; sw < 4; ++sw) begin
+                            set_all_lanes(3'(w), 2'(sw), 5'd30, 32'(i));      // stride = number of warps
+                            set_all_lanes(3'(w), 2'(sw), 5'd31, OUT_BASE);
+                        end
+
+                    $display("\n\nMandelbrot (%0d warps)", i);
+
+                    thread_ops = 0; counting = 1;
+                    launch_kernel(4'(i));
+                    wait_for_kernel_done(400000);
+                    counting = 0;
+
+                    // Per thread: 9 setup, then per chunk 5 (header) + 2 (chunk++ and branch) if skipped,
+                    // else 5 + 7 (cx, cy, zeros) + steps loop + 5 (store) + 2. Steps loop: 14 per full pass,
+                    // plus 6 for the pass that escapes (none if it ran all 32).
+                    expected_ops = 0;
+                    for (int w = 0; w < i; ++w) begin
+                        for (int t = 0; t < 32; ++t) begin
+                            expected_ops += 9;
+                            for (int chunk = w; chunk < CHUNKS; chunk += i) begin
+                                int px, py, s, zx, zy;
+                                px = (chunk & 1) * 32 + t;
+                                py = chunk >> 1;
+                                if (px >= WIDTH) expected_ops += 7;
+                                else begin
+                                    s = mandel_pixel(px, py, zx, zy);
+                                    expected_ops += 19 + ((s == 32) ? 32 * 14 : 14 * s + 6);
+                                end
+                            end
+                        end
+                    end
+                    assert (thread_ops == expected_ops)
+                        else $fatal(1, "Mandelbrot: thread_ops = %0d, expected %0d", thread_ops, expected_ops);
+
+                    // DDR after the flush: every pixel = its step count, padding (px 40-63) stays untouched
+                    errors = 0;
+                    for (int py = 0; py < HEIGHT; ++py) begin
+                        for (int px = 0; px < PITCH; ++px) begin
+                            int zx, zy;
+                            logic [31:0] got, exp_val;
+
+                            exp_val = (px < WIDTH) ? 32'(mandel_pixel(px, py, zx, zy)) : OUT_UNTOUCHED;
+                            got = read_word(OUT_BASE + 32'(4 * (py * PITCH + px)));
+
+                            if (got !== exp_val) begin
+                                if (errors < 5)
+                                    $error("Mandelbrot: out[%0d][%0d] = %h, expected %h", py, px, got, exp_val);
+                                errors++;
+                            end
+                        end
+                    end
+                    if (errors > 0) $fatal(1, "Mandelbrot: %0d wrong pixels in DDR", errors);
+
+                    // The picture as the GPU wrote it ('@' = never escaped, '.' = escaped, ' ' = not computed)
+                    for (int py = 0; py < HEIGHT; ++py) begin
+                        string line;
+                        line = "";
+                        for (int px = 0; px < WIDTH; ++px) begin
+                            logic [31:0] v;
+                            v = read_word(OUT_BASE + 32'(4 * (py * PITCH + px)));
+                            line = {line, (v == OUT_UNTOUCHED) ? " " : (v == 32) ? "@" : "."};
+                        end
+                        $display("%s", line);
+                    end
+
+                    // Registers: replay each thread's chunk loop. R10/R11 come from the last chunk it visited,
+                    // R12-R16 and R23 from the last pixel it actually computed (0 if it never computed one).
+                    for (int w = 0; w < i; ++w) begin
+                        for (int sw = 0; sw < 4; ++sw) begin
+                            for (int lane = 0; lane < 8; ++lane) begin
+                                int t, chunk, px, py, cx, cy, zx, zy, s, addr;
+
+                                t = sw * 8 + lane;
+                                cx = 0; cy = 0; zx = 0; zy = 0; s = 0; addr = 0;
+                                for (chunk = w; chunk < CHUNKS; chunk += i) begin
+                                    px = (chunk & 1) * 32 + t;
+                                    py = chunk >> 1;
+                                    if (px < WIDTH) begin
+                                        cx = -8192 + px * 307;
+                                        cy = -4096 + py * 1365;
+                                        s = mandel_pixel(px, py, zx, zy);
+                                        addr = OUT_BASE + 4 * (py * PITCH + px);
+                                    end
+                                end
+
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd1, 32'(w));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd2, 32'(t));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd3, 32'(chunk));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd4, 32'(CHUNKS));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd5, 32'(WIDTH));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd8, 32'd16384);
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd9, 32'd32);
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd10, 32'(px));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd11, 32'(py));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd12, 32'(cx));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd13, 32'(cy));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd14, 32'(zx));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd15, 32'(zy));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd16, 32'(s));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd23, 32'(addr));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd30, 32'(i));
+                                check_lane_register(3'(lane), 3'(w), 2'(sw), 5'd31, OUT_BASE);
+                            end
+                        end
+                    end
+
+                    display_results(i);
+                    display_memory_results();
+                    // One STORE per chunk (every chunk has at least 8 real pixels), 12 at any warp count, each a
+                    // different line in its own set: 1 write-allocate miss each, no evictions, all flushed at the end.
+                    // 0xA8 = 2 I$ lines.
+                    check_memory_counts("Mandelbrot", 0, CHUNKS, CHUNKS, 0, CHUNKS, 2);
                 end
             end
         end
