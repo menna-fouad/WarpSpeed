@@ -176,12 +176,27 @@ DONE
 
 The testbench monitors every register-file write: warp, thread, register, data value, and how many times each was written. It checks all of them against a reference model. Any missing or duplicate writeback, wrong value, or write from the wrong divergence path fails the test.
 
-The kernel completes in **4,888 cycles** (including the final D$ flush) and passes with all **2,624** expected register writes matching.
+The kernel completes in **3,873 cycles** (including the final D$ flush) and passes with all **2,624** expected register writes matching.
+
+## Performance
+
+Measured in Verilator simulation at 100 MHz with a behavioural DDR model; every run is checked against a reference. Full results and analysis of performance, area, and power breakdown are in [`benchmark/README.md`](benchmark/README.md).
+
+| Kernel (8 warps) | Thread-ops/cycle (peak 8) | Limited by |
+|---|---|---|
+| Arithmetic stream | 6.68–6.73 | Near peak: 84% of cycles issue useful work |
+| Matrix-vector | 4.42–4.52 | D$ misses; reuse of `x` keeps it scaling to 8 warps |
+| Mandelbrot | 3.00–3.03 | Divergence (39.5% SIMD efficiency) |
+| SAXPY | 2.34–2.37 | Blocking D$: saturates at 4 warps |
+
+- Memory-heavy kernels plateau at about 330–345 MB/s, a quarter of the DDR2 peak, because the D$ serves one miss at a time.
+- The SM uses 48,924 LUTs (77% of the device) and an estimated 0.273 W; the control logic (coalescing unit and reconvergence stacks) takes 49% of its LUTs, the FMAs and ALUs 19%.
 
 ## Repository Structure
 
 ```text
 docs/              # Architecture diagram
+benchmark/         # Performance benchmark and results
 
 src/
 ├── control/       # Warp scheduling, branch mask split, and reconvergence stack
@@ -227,6 +242,7 @@ Each test prints its cycle count followed by `PASSED`; any failure stops the sim
 
 This is a single-SM RTL project that may be expanded to include the following:
 
+- [ ] Validate DDR2 and measure performance on hardware
 - [ ] Add shared memory to allow communication between threads
 - [ ] Implement a scoreboard to only mark a warp not ready on a true dependency
 - [ ] Include block-level barrier synchronization between threads/warps
@@ -238,5 +254,4 @@ This is a single-SM RTL project that may be expanded to include the following:
 
 - [x] Complete full `sm_top` integration tests for arithmetic, memory, divergence, and multi-warp workloads
 - [x] Run FPGA synthesis and analysis (timing, resource utilization, and power) in Vivado (timing closed at 100 MHz)
-- [ ] Benchmark performance in simulation
-- [ ] Validate DDR2 and measure performance on hardware
+- [x] Benchmark performance in simulation
